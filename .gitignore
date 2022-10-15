@@ -1,0 +1,6 @@
+token
+auth_password
+to_print
+*.swp
+printed_files
+printerbot.log
