@@ -1,8 +1,9 @@
 #!/usr/bin/python3
 
+import logging
 import os
 import pathlib
-import logging
+import re
 from telegram import Update
 from telegram.ext import Updater
 from telegram.ext import ContextTypes
@@ -79,8 +80,9 @@ def cancel(update: Update, context: CallbackContext):
         return request_auth(update, context)
 
     job_id = ''.join(context.args).strip()
-    if job_id.find(' ') != -1:
+    if not re.match('^[a-zA-Z0-9_\-]+$', job_id):
         context.bot.send_message(chat_id=update.effective_chat.id, text="Invalid job_id '{}'".format(job_id))
+        return
     logger.info("User {} cancel request, job '{}'".format(update.message.from_user.username, job_id))
     os.system("cancel {}".format(job_id))
     context.bot.send_message(chat_id=update.effective_chat.id, text="Cancel command complete")
