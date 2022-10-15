@@ -127,10 +127,17 @@ def maybe_convert(update: Update, context: CallbackContext, file_path):
 def print_file(update: Update, context: CallbackContext):
     if not auth_passed(update):
         return request_auth(update, context)
-
-    file_id = update.message.document.file_id
-    file_name = update.message.document.file_name
-    file_size = update.message.document.file_size
+    if update.message.document is not None:
+        file_id = update.message.document.file_id
+        file_size = update.message.document.file_size
+        file_name = update.message.document.file_name
+    elif update.message.photo is not None:
+        file_id = update.message.photo[-1].file_id
+        file_size = update.message.photo[-1].file_size
+        file_name = update.message.photo[-1].file_unique_id
+    else:
+        logger.info("Unknown message type")
+        return
 
     if file_size > file_size_limit:
         context.bot.send_message(chat_id=update.effective_chat.id, text="File is too big ({} > {})!".format(file_size, file_size_limit))
@@ -151,11 +158,12 @@ def print_file(update: Update, context: CallbackContext):
         return
 
     num_pages = os.popen('pdfinfo "{}" | grep Pages'.format(file_path)).read().strip()
+    num_pages = int(''.join(filter(str.isdigit, num_pages)))
 
-    logger.info("Printing file {}. {}...".format(file_path, num_pages))
+    logger.info("Printing file {}. Number of pages: {}...".format(file_path, num_pages))
     cmd_print_file(file_path)
 
-    logger.info("File {} sent for printing. {}".format(file_path, num_pages))
+    logger.info("File {} sent for printing. Number of pages: {}".format(file_path, num_pages))
     context.bot.send_message(chat_id=update.effective_chat.id, text="File sent for printing!")
 
 
@@ -169,6 +177,7 @@ def main():
     dispatcher.add_handler(CommandHandler('completed', completed))
     dispatcher.add_handler(CommandHandler('cancel', cancel))
     dispatcher.add_handler(MessageHandler(filters=Filters.document, callback=print_file))
+    dispatcher.add_handler(MessageHandler(filters=Filters.photo, callback=print_file))
 
     logger.info("Listening...")
     updater.start_polling()
