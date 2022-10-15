@@ -12,11 +12,11 @@ In order to print something, just upload a file without any commands. A lot of f
  
 ## Details
  * Uses simple password authentication
- * Uses libreoffice to convert files to PDF format before printing
- * Uses `lpr` to print send a file on your default printer
- * Uses python-telegram-bot package to interface with the Telegram API.
+ * Uses `libreoffice` to convert files to PDF format before printing
+ * Uses `lpr` to send a file to your default printer
+ * Uses `python-telegram-bot` package to interface with the Telegram API
 
 # Install
 
 * Python packages: `pip3 install python-telegram-bot`
-* Libreoffice. Install it using your package manager, like 'apt install libreoffice'
+* Libreoffice. Install it using your package manager, like `apt install libreoffice`
