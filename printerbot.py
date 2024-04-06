@@ -5,6 +5,7 @@ import os
 import pathlib
 import re
 import telegram
+import tempfile
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackContext, ContextTypes, CallbackQueryHandler
 
@@ -140,6 +141,15 @@ def get_num_pages(file_path):
     num_pages = os.popen('pdfinfo "{}" | grep Pages'.format(file_path)).read().strip()
     return int(''.join(filter(str.isdigit, num_pages)))
 
+def get_temp_name_for(file_name: str) -> str:
+    temp_name = next(tempfile._get_candidate_names())
+
+    ext = ""
+    _, file_extension = os.path.splitext(file_name)
+    if file_extension:
+        ext = file_extension
+
+    return temp_name+ext
 
 async def text_callback(update: Update, context: CallbackContext):
     await update.message.reply_text("Use commands")
@@ -168,21 +178,24 @@ async def upload_file(update: Update, context: CallbackContext):
 
     reply_msg = await update.message.reply_text("Downloading file...")
 
-    file_path = files_dir + '/' + file_name
+    temp_name = get_temp_name_for(file_name)
+    file_path = files_dir + '/' + temp_name
 
     logger.info("Downloading file {} from {}...".format(file_name, update.message.from_user.username))
     await new_file.download_to_drive(custom_path=file_path)
-    logger.info("Downloaded  file {} from {}!".format(file_name, update.message.from_user.username))
+    logger.info("Downloaded file {} as {}".format(file_name, temp_name))
 
     (file_path, success) = await maybe_convert(context, reply_msg, file_path)
     if not success:
         update_message(context, reply_msg, "Failed to convert file {}, size {}!".format(file_name, file_size))
         return
+    logger.info("Converted file {}".format(file_path))
 
     # Delete upload status message after successful upload and convert
     context.bot.delete_message(reply_msg.chat.id, reply_msg.message_id)
 
     num_pages = get_num_pages(file_path)
+    logger.info("number of pages: {}".format(num_pages))
 
     keyboard = [
         [telegram.InlineKeyboardButton("Print", callback_data="print {}".format(file_path))],
