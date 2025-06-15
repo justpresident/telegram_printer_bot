@@ -5,3 +5,4 @@ to_print
 printed_files
 printerbot.log
 *.log*
+__pycache__
