@@ -4,3 +4,4 @@ to_print
 *.swp
 printed_files
 printerbot.log
+*.log*

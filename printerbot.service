@@ -1,0 +1,25 @@
+[Unit]
+Description=SSH tunnel from sshd to romst.com
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=20
+User=italiano
+WorkingDirectory=/home/italiano/printerbot
+ExecStart=/home/italiano/printerbot/printerbot.py
+
+# Provide a private /tmp and /var/tmp.
+PrivateTmp=true
+# Mount /usr, /boot/ and /etc read-only for the process.
+ProtectSystem=full
+# Disallow the process and all of its children to gain
+# new privileges through execve().
+NoNewPrivileges=true
+# Deny the creation of writable and executable memory mappings.
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
