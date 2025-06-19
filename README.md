@@ -4,7 +4,7 @@ It also exposes some basic printer diagnostics and print job management.
 In order to print something, just upload a file without any commands. A lot of formats are supported.
 
 ## Commands:
- * `/start` - Starts interaction and print current state
+ * `/start` - Starts interaction and prints current state
  * `/auth <password>` - Authenticates current session with a password against password stored in auth_password file
  * `/pending` - Lists all pending print jobs
  * `/completed` - Lists last 10 completed print jobs
@@ -16,7 +16,7 @@ In order to print something, just upload a file without any commands. A lot of f
  * Uses `lpr` to send a file to your default printer
  * Uses `python-telegram-bot` package to interface with the Telegram API
 
-# Install
+# Install Dependencies
 
 * Python packages: `pip3 install python-telegram-bot`
 * Libreoffice. Install it using your package manager, like `apt install libreoffice`
