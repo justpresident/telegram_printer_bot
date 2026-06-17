@@ -1,0 +1,588 @@
+"""TelegramPrinterBot: all Telegram I/O and handler wiring."""
+
+import os
+import re
+import logging
+import secrets
+import asyncio
+from dataclasses import replace
+from typing import Optional, Dict, Any, List
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackContext, ContextTypes,
+    CallbackQueryHandler,
+)
+from telegram.ext import filters
+
+from .domain import FileType, FileInfo, PrintResult, JobPhase
+from .service import PrinterBotService
+from .ui import (
+    build_options_keyboard, apply_option_action, fenced_block,
+    BOT_COMMANDS, SCOPE_JOB, SCOPE_SETTINGS,
+)
+
+
+class TelegramPrinterBot:
+    """Telegram bot wrapper around PrinterBotService"""
+
+    # how long live job-status polling runs: STATUS_POLLS * STATUS_INTERVAL secs
+    STATUS_POLLS = 40
+    STATUS_INTERVAL = 3
+    # how often the background sweep removes stale files from files_dir
+    CLEANUP_INTERVAL = 3600
+
+    def __init__(self, token: str, service: PrinterBotService, logger: logging.Logger):
+        self.token = token
+        self.service = service
+        self.logger = logger
+        self.application = None
+
+    def create_application(self) -> Application:
+        self.application = (
+            Application.builder()
+            .token(self.token)
+            .post_init(self._post_init)
+            .build()
+        )
+
+        # Commands
+        self.application.add_handler(CommandHandler("start", self.start))
+        self.application.add_handler(CommandHandler("auth", self.authorize))
+        self.application.add_handler(CommandHandler("pending", self.pending))
+        self.application.add_handler(CommandHandler("completed", self.completed))
+        self.application.add_handler(CommandHandler("cancel", self.cancel))
+        self.application.add_handler(CommandHandler("settings", self.settings))
+
+        # Files
+        self.application.add_handler(
+            MessageHandler(filters.Document.ALL | filters.PHOTO, self.upload_file)
+        )
+        self.application.add_handler(CallbackQueryHandler(self.button))
+        self.application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_callback)
+        )
+
+        return self.application
+
+    async def _post_init(self, application: Application) -> None:
+        try:
+            await application.bot.set_my_commands(
+                [BotCommand(name, desc) for name, desc in BOT_COMMANDS]
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to set command menu: {e}")
+        # Periodically sweep abandoned files (the startup sweep in main() only
+        # runs once; this bounds disk use during a long-lived session).
+        application.create_task(self._periodic_cleanup())
+
+    async def _periodic_cleanup(self) -> None:
+        while True:
+            await asyncio.sleep(self.CLEANUP_INTERVAL)
+            try:
+                removed = await self._offload(self.service.cleanup_stale_files)
+                if removed:
+                    self.logger.info(f"Periodic cleanup removed {removed} stale file(s)")
+            except Exception as e:
+                self.logger.error(f"Periodic cleanup failed: {e}")
+
+    def run(self):
+        if not self.application:
+            self.create_application()
+
+        self.logger.info("🤖 Telegram Printer Bot starting...")
+        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # -- helpers ------------------------------------------------------------
+
+    def _get_user_id(self, update: Update) -> Optional[int]:
+        if update.message:
+            return update.message.from_user.id
+        elif update.callback_query:
+            return update.callback_query.from_user.id
+        return None
+
+    def _get_username(self, update: Update) -> str:
+        user_id = self._get_user_id(update)
+        if update.message and update.message.from_user.username:
+            return update.message.from_user.username
+        elif update.callback_query and update.callback_query.from_user.username:
+            return update.callback_query.from_user.username
+        return f"user_{user_id}"
+
+    async def _request_auth(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("Please authorize by \"/auth <password>\".")
+
+    async def _update_message(self, context: CallbackContext, msg, text: str):
+        try:
+            await context.bot.edit_message_text(text, msg.chat.id, msg.message_id)
+        except Exception as e:
+            self.logger.error(f"Error updating message: {e}")
+
+    async def _edit_panel(self, query, text: str, reply_markup=None):
+        """Edit a panel message whether it is a text message or a photo (caption)."""
+        try:
+            if query.message and query.message.photo:
+                await query.edit_message_caption(caption=text, reply_markup=reply_markup)
+            else:
+                await query.edit_message_text(text=text, reply_markup=reply_markup)
+        except Exception as e:
+            self.logger.error(f"Error editing panel: {e}")
+
+    def _job_registry(self, context: CallbackContext) -> Dict[str, Any]:
+        return context.user_data.setdefault("jobs", {})
+
+    @staticmethod
+    async def _offload(func, *args):
+        """Run a blocking (subprocess-bound) service call off the event loop so
+        the single asyncio loop stays responsive during conversions/printing."""
+        return await asyncio.to_thread(func, *args)
+
+    async def _printer_names(self) -> List[str]:
+        printers = await self._offload(self.service.list_printers)
+        return [p.name for p in printers]
+
+    # -- command handlers ---------------------------------------------------
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = self._get_user_id(update)
+        username = self._get_username(update)
+        self.logger.info(f"User {username} (ID: {user_id}) /start request")
+
+        if not self.service.is_user_authorized(user_id):
+            return await self._request_auth(update, context)
+
+        status = await self._offload(self.service.get_printer_status)
+        if status.error:
+            await update.message.reply_text("🖨️ You are authorized to print! Just send a file here.")
+        else:
+            msg = "🖨️ You are authorized to print! Just send a file here.\n\n"
+            msg += f"📊 Current printer status:\n{fenced_block(status.status)}\n\n"
+            msg += f"📋 Printer queue:\n{fenced_block(status.queue)}"
+            await update.message.reply_text(msg, parse_mode='Markdown')
+
+    async def pending(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = self._get_user_id(update)
+        username = self._get_username(update)
+        self.logger.info(f"User {username} (ID: {user_id}) /pending request")
+
+        if not self.service.is_user_authorized(user_id):
+            return await self._request_auth(update, context)
+
+        jobs = await self._offload(self.service.get_pending_jobs)
+        if jobs.error:
+            await update.message.reply_text("❌ Error checking pending jobs")
+        else:
+            msg = "✅ No pending jobs found" if not jobs.jobs else f"⏳ Pending jobs:\n{fenced_block(jobs.jobs)}"
+            await update.message.reply_text(msg, parse_mode='Markdown')
+
+    async def completed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = self._get_user_id(update)
+        username = self._get_username(update)
+        self.logger.info(f"User {username} (ID: {user_id}) /completed request")
+
+        if not self.service.is_user_authorized(user_id):
+            return await self._request_auth(update, context)
+
+        jobs = await self._offload(self.service.get_completed_jobs)
+        if jobs.error:
+            await update.message.reply_text("❌ Error checking completed jobs")
+        else:
+            msg = "📋 No completed jobs found" if not jobs.jobs else f"✅ Recent completed jobs:\n{fenced_block(jobs.jobs)}"
+            await update.message.reply_text(msg, parse_mode='Markdown')
+
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = self._get_user_id(update)
+        username = self._get_username(update)
+        self.logger.info(f"User {username} (ID: {user_id}) /cancel request")
+
+        if not self.service.is_user_authorized(user_id):
+            return await self._request_auth(update, context)
+
+        if not context.args:
+            await update.message.reply_text("❌ Please provide a job ID: `/cancel <job_id>`", parse_mode='Markdown')
+            return
+
+        # A job id is a single token (e.g. "Office-42"); use the first arg only.
+        job_id = context.args[0].strip()
+        success, message = await self._offload(self.service.cancel_job, job_id)
+
+        if success:
+            await update.message.reply_text(f"✅ {message}")
+        else:
+            await update.message.reply_text(f"❌ {message}")
+
+    async def settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = self._get_user_id(update)
+        username = self._get_username(update)
+        self.logger.info(f"User {username} (ID: {user_id}) /settings request")
+
+        if not self.service.is_user_authorized(user_id):
+            return await self._request_auth(update, context)
+
+        options = self.service.default_options_for(user_id)
+        keyboard = build_options_keyboard(options, SCOPE_SETTINGS, "_", await self._printer_names())
+        await update.message.reply_text(
+            "⚙️ Your default print settings (applied to every new file):",
+            reply_markup=keyboard,
+        )
+
+    async def authorize(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = self._get_user_id(update)
+        username = self._get_username(update)
+        self.logger.info(f"User {username} (ID: {user_id}) /authorize request")
+
+        if not context.args:
+            await update.message.reply_text("❌ Please provide password: `/auth <password>`", parse_mode='Markdown')
+            return
+
+        password = ' '.join(context.args)
+        success, message = self.service.authenticate_user(user_id, password)
+
+        if success:
+            self.logger.info(f"User {username} (ID: {user_id}) authorized.")
+            await update.message.reply_text(f"🎉 {message}")
+        else:
+            if "already authorized" not in message:
+                self.logger.info(f"User {username} (ID: {user_id}) entered wrong password.")
+            await update.message.reply_text(f"{'✅' if 'already' in message else '❌'} {message}")
+
+    async def text_callback(self, update: Update, context: CallbackContext):
+        user_id = self._get_user_id(update)
+        if not self.service.is_user_authorized(user_id):
+            return await self._request_auth(update, context)
+
+        # If we're waiting for a typed page range, consume this message as the range.
+        if context.user_data.get("awaiting_range"):
+            return await self._handle_range_input(update, context)
+
+        await update.message.reply_text("📄 Please send a document or image file to print.\n\n"
+                                      "Available commands:\n"
+                                      "• `/start` - Show printer status\n"
+                                      "• `/settings` - Default print settings\n"
+                                      "• `/pending` - Show pending jobs\n"
+                                      "• `/completed` - Show completed jobs\n"
+                                      "• `/cancel <job_id>` - Cancel a print job")
+
+    async def upload_file(self, update: Update, context: CallbackContext):
+        user_id = self._get_user_id(update)
+        username = self._get_username(update)
+        self.logger.info(f"User {username} (ID: {user_id}) file upload")
+
+        if not self.service.is_user_authorized(user_id):
+            return await self._request_auth(update, context)
+
+        # Extract file info
+        file_info = self._extract_file_info(update.message)
+        if not file_info:
+            await update.message.reply_text("❌ Unsupported file type. Please send a document or photo.")
+            return
+
+        # Validate file
+        valid, message = self.service.validate_file(file_info)
+        if not valid:
+            await update.message.reply_text(f"❌ {message}")
+            return
+
+        reply_msg = await update.message.reply_text("⬇️ Downloading file...")
+
+        try:
+            # Download file
+            temp_name = self.service.generate_temp_filename(file_info.file_name)
+            file_path = os.path.join(self.service.files_dir, temp_name)
+
+            # Get file object and download
+            if update.message.document:
+                new_file = await update.message.document.get_file()
+            else:  # photo
+                new_file = await update.message.photo[-1].get_file()
+
+            await new_file.download_to_drive(custom_path=file_path)
+            self.logger.info(f"Downloaded file '{file_info.file_name}' as '{temp_name}'")
+
+            # Process file
+            await self._update_message(context, reply_msg, "🔄 Processing file...")
+            success, message, page_count, processed_path = await self._offload(self.service.process_file, file_path)
+
+            if not success:
+                await self._update_message(context, reply_msg, f"❌ {message}")
+                return
+
+            # Delete status message
+            try:
+                await context.bot.delete_message(reply_msg.chat.id, reply_msg.message_id)
+            except Exception:
+                pass
+
+            await self._present_print_panel(update, context, user_id, processed_path, page_count)
+
+        except Exception as e:
+            self.logger.error(f"Error processing file: {e}")
+            await self._update_message(context, reply_msg, f"❌ Error processing file: {str(e)}")
+
+    async def _present_print_panel(self, update, context, user_id, processed_path, page_count):
+        """Register the job and show the interactive options panel (with preview)."""
+        options = self.service.default_options_for(user_id)
+        printer_names = await self._printer_names()
+
+        token = secrets.token_hex(4)
+        self._job_registry(context)[token] = {
+            "file_path": processed_path,
+            "page_count": page_count,
+            "options": options,
+            "printers": printer_names,
+        }
+
+        keyboard = build_options_keyboard(options, SCOPE_JOB, token, printer_names)
+        page_text = f"{page_count} page{'s' if page_count != 1 else ''}"
+        caption = f"📄 Ready to print: {page_text}\nChoose options, then press Print."
+
+        preview_path = await self._offload(self.service.render_preview, processed_path)
+        if preview_path:
+            try:
+                with open(preview_path, "rb") as preview:
+                    await update.message.reply_photo(preview, caption=caption, reply_markup=keyboard)
+                return
+            except Exception as e:
+                self.logger.error(f"Error sending preview: {e}")
+            finally:
+                try:
+                    os.unlink(preview_path)
+                except OSError:
+                    pass
+
+        await update.message.reply_text(caption, reply_markup=keyboard)
+
+    # -- callback routing ---------------------------------------------------
+
+    async def button(self, update: Update, context: CallbackContext):
+        query = update.callback_query
+        user_id = self._get_user_id(update)
+        username = self._get_username(update)
+
+        self.logger.info(f"User {username} (ID: {user_id}) clicked button: {query.data}")
+
+        if not self.service.is_user_authorized(user_id):
+            await query.answer("❌ Not authorized")
+            return
+
+        await query.answer()
+
+        verb, _, rest = query.data.partition(" ")
+
+        if verb == "noop":
+            return
+        if verb == "cancel":
+            return await self._handle_cancel_button(query, rest.strip())
+
+        scope, _, key = rest.partition(":")
+        if scope not in (SCOPE_JOB, SCOPE_SETTINGS):
+            await self._edit_panel(query, "❌ Invalid button data")
+            return
+
+        if scope == SCOPE_JOB:
+            await self._handle_job_button(query, context, verb, key, user_id)
+        else:
+            await self._handle_settings_button(query, context, verb, key, user_id)
+
+    async def _handle_cancel_button(self, query, job_id: str):
+        success, message = await self._offload(self.service.cancel_job, job_id)
+        emoji = "🚫" if success else "❌"
+        await self._edit_panel(query, f"{emoji} {message}")
+
+    async def _handle_job_button(self, query, context, verb, token, user_id):
+        registry = self._job_registry(context)
+        entry = registry.get(token)
+        if not entry:
+            await self._edit_panel(query, "⌛ This file is no longer available. Please re-send it.")
+            return
+
+        if verb == "delete":
+            success, message = self.service.delete_file(entry["file_path"])
+            registry.pop(token, None)
+            await self._edit_panel(query, f"{'🗑️' if success else '❌'} {message}")
+            return
+
+        if verb == "print":
+            result = await self._offload(self.service.print_file, entry["file_path"], entry["options"])
+            registry.pop(token, None)
+            if not result.success:
+                await self._edit_panel(query, f"❌ {result.message}")
+                return
+            await self._start_live_status(query, context, result, entry["page_count"])
+            return
+
+        if verb == "range":
+            await self._prompt_for_range(query, context, SCOPE_JOB, token)
+            return
+
+        # An option mutation: update the registry entry and re-render.
+        entry["options"] = apply_option_action(entry["options"], verb, entry.get("printers"))
+        await self._rerender_keyboard(query, entry["options"], SCOPE_JOB, token, entry.get("printers"))
+
+    async def _handle_settings_button(self, query, context, verb, key, user_id):
+        settings = self.service.get_user_settings(user_id)
+        options = settings.default_options
+        printer_names = await self._printer_names()
+
+        if verb == "done":
+            await self._edit_panel(query, "✅ Settings saved. They'll apply to every new file.")
+            return
+
+        if verb == "range":
+            await self._prompt_for_range(query, context, SCOPE_SETTINGS, key)
+            return
+
+        new_options = apply_option_action(options, verb, printer_names)
+        self.service.update_user_settings(user_id, replace(settings, default_options=new_options))
+        await self._rerender_keyboard(query, new_options, SCOPE_SETTINGS, key, printer_names)
+
+    async def _rerender_keyboard(self, query, options, scope, key, printer_names):
+        keyboard = build_options_keyboard(options, scope, key, printer_names)
+        try:
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+        except Exception as e:
+            self.logger.error(f"Error re-rendering keyboard: {e}")
+
+    # -- page-range typed input ---------------------------------------------
+
+    async def _prompt_for_range(self, query, context, scope, key):
+        if not query.message:
+            # Message too old / inaccessible — nothing to anchor the panel edit to.
+            return
+        context.user_data["awaiting_range"] = {
+            "scope": scope,
+            "key": key,
+            "chat_id": query.message.chat.id,
+            "message_id": query.message.message_id,
+        }
+        await context.bot.send_message(
+            query.message.chat.id,
+            "📑 Send the page range to print, e.g. `2-5` or `1,3,5` — or `all` for every page.",
+            parse_mode="Markdown",
+        )
+
+    async def _handle_range_input(self, update: Update, context: CallbackContext):
+        raw = (update.message.text or "").strip()
+
+        if raw.lower() in ("all", "*", ""):
+            page_ranges = ""
+        elif re.match(r'^[0-9]+(?:-[0-9]+)?(?:\s*,\s*[0-9]+(?:-[0-9]+)?)*$', raw):
+            page_ranges = re.sub(r'\s+', '', raw)
+        else:
+            # Keep awaiting_range set so the user's next message retries the range.
+            await update.message.reply_text("❌ Invalid range. Use e.g. `2-5` or `1,3,5` or `all`.", parse_mode="Markdown")
+            return
+
+        pending = context.user_data.pop("awaiting_range")
+        scope, key = pending["scope"], pending["key"]
+        user_id = self._get_user_id(update)
+
+        if scope == SCOPE_JOB:
+            entry = self._job_registry(context).get(key)
+            if not entry:
+                await update.message.reply_text("⌛ This file is no longer available. Please re-send it.")
+                return
+            entry["options"] = replace(entry["options"], page_ranges=page_ranges)
+            options, printer_names = entry["options"], entry.get("printers")
+        else:
+            settings = self.service.get_user_settings(user_id)
+            options = replace(settings.default_options, page_ranges=page_ranges)
+            self.service.update_user_settings(user_id, replace(settings, default_options=options))
+            printer_names = await self._printer_names()
+
+        # Re-render the original panel's keyboard in place.
+        keyboard = build_options_keyboard(options, scope, key, printer_names)
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=pending["chat_id"],
+                message_id=pending["message_id"],
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            self.logger.error(f"Error updating panel after range input: {e}")
+
+        label = "all pages" if not page_ranges else f"pages {page_ranges}"
+        await update.message.reply_text(f"✅ Will print {label}.")
+
+    # -- live job status ----------------------------------------------------
+
+    async def _start_live_status(self, query, context, result: PrintResult, page_count):
+        if not result.job_id:
+            await self._edit_panel(query, f"🖨️ {result.message}")
+            return
+
+        cancel_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🚫 Cancel", callback_data=f"cancel {result.job_id}")]]
+        )
+        await self._edit_panel(query, f"🖨️ {result.message}\nJob `{result.job_id}` queued…", cancel_kb)
+
+        # Background polling needs a concrete message to edit; skip it if the
+        # callback message is inaccessible (e.g. too old).
+        if not query.message:
+            return
+        context.application.create_task(
+            self._poll_job_status(
+                context, query.message.chat.id, query.message.message_id,
+                result.job_id, page_count, bool(query.message.photo),
+            )
+        )
+
+    async def _poll_job_status(self, context, chat_id, message_id, job_id, page_count, is_photo):
+        seen_active = False
+        cancel_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🚫 Cancel", callback_data=f"cancel {job_id}")]]
+        )
+        try:
+            for _ in range(self.STATUS_POLLS):
+                await asyncio.sleep(self.STATUS_INTERVAL)
+                state = await self._offload(self.service.get_job_state, job_id)
+
+                if state.phase == JobPhase.COMPLETED:
+                    await self._edit_by_id(context, chat_id, message_id, is_photo,
+                                           f"✅ Printed {page_count} page(s) — job {job_id}")
+                    return
+                if state.phase in (JobPhase.PROCESSING, JobPhase.PENDING):
+                    if not seen_active:
+                        seen_active = True
+                        await self._edit_by_id(context, chat_id, message_id, is_photo,
+                                               f"🖨️ Printing… job {job_id}", cancel_kb)
+                elif state.phase == JobPhase.UNKNOWN and seen_active:
+                    await self._edit_by_id(context, chat_id, message_id, is_photo,
+                                           f"✅ Finished — job {job_id}")
+                    return
+        except Exception as e:
+            self.logger.error(f"Error polling job status: {e}")
+
+    async def _edit_by_id(self, context, chat_id, message_id, is_photo, text, reply_markup=None):
+        try:
+            if is_photo:
+                await context.bot.edit_message_caption(
+                    chat_id=chat_id, message_id=message_id, caption=text, reply_markup=reply_markup)
+            else:
+                await context.bot.edit_message_text(
+                    text, chat_id, message_id, reply_markup=reply_markup)
+        except Exception as e:
+            self.logger.debug(f"Status edit skipped: {e}")
+
+    # -- file extraction ----------------------------------------------------
+
+    def _extract_file_info(self, message) -> Optional[FileInfo]:
+        if message.document:
+            return FileInfo(
+                file_id=message.document.file_id,
+                file_size=message.document.file_size or 0,  # Telegram may omit size
+                file_name=message.document.file_name or "document",
+                file_type=FileType.DOCUMENT
+            )
+        elif message.photo:
+            photo = message.photo[-1]  # Get highest resolution
+            return FileInfo(
+                file_id=photo.file_id,
+                file_size=photo.file_size or 0,  # Telegram may omit size
+                file_name=f"photo_{photo.file_unique_id}.jpg",
+                file_type=FileType.PHOTO
+            )
+        return None
+
+

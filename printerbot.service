@@ -1,5 +1,5 @@
 [Unit]
-Description=SSH tunnel from sshd to romst.com
+Description=Telegram printer bot
 After=network.target
 StartLimitIntervalSec=0
 
@@ -9,7 +9,7 @@ Restart=always
 RestartSec=20
 User=italiano
 WorkingDirectory=/home/italiano/printerbot
-ExecStart=/home/italiano/printerbot/printerbot.py
+ExecStart=/usr/bin/python3 -m printerbot
 
 # Provide a private /tmp and /var/tmp.
 PrivateTmp=true
