@@ -2,20 +2,39 @@
 
 import logging
 import os
+import json
 import pathlib
 import re
+import secrets
+import shlex
+import subprocess
 import tempfile
 import asyncio
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Optional, Tuple, Set, Dict, Any
+from dataclasses import dataclass, field, replace
+from typing import Optional, Tuple, Set, Dict, Any, List
 from enum import Enum
 
-import telegram
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackContext, ContextTypes, CallbackQueryHandler
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackContext,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 from telegram.ext import filters
 
+
+# =============================================================================
+# Domain types
+# =============================================================================
 
 class FileType(Enum):
     DOCUMENT = "document"
@@ -44,6 +63,241 @@ class JobStatus:
     error: Optional[str] = None
 
 
+class Duplex(Enum):
+    """Printing sides. Values are CUPS `sides` option values."""
+    ONE_SIDED = "one-sided"
+    TWO_SIDED_LONG = "two-sided-long-edge"
+    TWO_SIDED_SHORT = "two-sided-short-edge"
+
+
+class ColorMode(Enum):
+    COLOR = "color"
+    GRAYSCALE = "grayscale"
+
+
+class PaperSize(Enum):
+    """Paper size. Values are CUPS `media` option values."""
+    A4 = "A4"
+    LETTER = "Letter"
+    LEGAL = "Legal"
+    A3 = "A3"
+
+
+# Ordered cycles used by the interactive UI to step through choices.
+DUPLEX_CYCLE: List[Duplex] = [Duplex.ONE_SIDED, Duplex.TWO_SIDED_LONG, Duplex.TWO_SIDED_SHORT]
+PAPER_CYCLE: List[PaperSize] = [PaperSize.A4, PaperSize.LETTER, PaperSize.LEGAL, PaperSize.A3]
+NUP_CYCLE: List[int] = [1, 2, 4, 6]
+MAX_COPIES = 99
+
+
+@dataclass(frozen=True)
+class PrintOptions:
+    """Backend-agnostic description of how a document should be printed.
+
+    Immutable: derive a changed copy with `dataclasses.replace`. Translation to
+    a specific print backend (e.g. CUPS `lp` flags) lives in the printer
+    adapter, so this stays free of backend details.
+    """
+    copies: int = 1
+    duplex: Duplex = Duplex.ONE_SIDED
+    color: ColorMode = ColorMode.COLOR
+    paper_size: PaperSize = PaperSize.A4
+    number_up: int = 1
+    page_ranges: str = ""          # "" means all pages, else e.g. "2-5" / "1,3,5"
+    printer: Optional[str] = None  # None means the system default printer
+    dry_run: bool = False          # log the print command instead of executing it
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "copies": self.copies,
+            "duplex": self.duplex.name,
+            "color": self.color.name,
+            "paper_size": self.paper_size.name,
+            "number_up": self.number_up,
+            "page_ranges": self.page_ranges,
+            "printer": self.printer,
+            "dry_run": self.dry_run,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PrintOptions":
+        """Reconstruct from persisted dict, tolerating missing/invalid fields."""
+        def _enum(enum_cls, name, default):
+            try:
+                return enum_cls[name]
+            except (KeyError, TypeError):
+                return default
+
+        try:
+            copies = max(1, min(MAX_COPIES, int(data.get("copies", 1))))
+        except (TypeError, ValueError):
+            copies = 1
+        try:
+            number_up = int(data.get("number_up", 1))
+            if number_up not in NUP_CYCLE:
+                number_up = 1
+        except (TypeError, ValueError):
+            number_up = 1
+
+        return cls(
+            copies=copies,
+            duplex=_enum(Duplex, data.get("duplex"), Duplex.ONE_SIDED),
+            color=_enum(ColorMode, data.get("color"), ColorMode.COLOR),
+            paper_size=_enum(PaperSize, data.get("paper_size"), PaperSize.A4),
+            number_up=number_up,
+            page_ranges=str(data.get("page_ranges") or ""),
+            printer=data.get("printer") or None,
+            dry_run=bool(data.get("dry_run", False)),
+        )
+
+
+@dataclass
+class PrintResult:
+    success: bool
+    job_id: Optional[str]
+    message: str
+
+
+@dataclass
+class PrinterInfo:
+    name: str
+    is_default: bool = False
+    description: str = ""
+
+
+class JobPhase(Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class JobState:
+    job_id: str
+    phase: JobPhase
+    raw: str = ""
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.phase == JobPhase.COMPLETED
+
+
+@dataclass
+class UserSettings:
+    """Per-user persisted preferences. Currently just default print options,
+    kept as a wrapper so more preferences can be added without changing the
+    storage interface."""
+    default_options: PrintOptions = field(default_factory=PrintOptions)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"default_options": self.default_options.to_dict()}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UserSettings":
+        return cls(default_options=PrintOptions.from_dict(data.get("default_options", {})))
+
+
+# =============================================================================
+# Command runner (single seam for all external process calls)
+# =============================================================================
+
+@dataclass
+class CommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+
+class CommandRunner(ABC):
+    """Abstraction over running external commands. A single seam keeps the
+    adapters free of shell quoting and makes them trivially testable."""
+
+    @abstractmethod
+    def run(self, args: List[str], timeout: Optional[int] = None) -> CommandResult:
+        pass
+
+
+class SubprocessCommandRunner(CommandRunner):
+    """Runs commands via subprocess with an argument list (no shell), avoiding
+    shell-injection and capturing stdout/stderr."""
+
+    def run(self, args: List[str], timeout: Optional[int] = None) -> CommandResult:
+        try:
+            proc = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            return CommandResult(proc.returncode, proc.stdout, proc.stderr)
+        except subprocess.TimeoutExpired as e:
+            return CommandResult(124, e.stdout or "", f"timed out after {timeout}s")
+        except FileNotFoundError as e:
+            return CommandResult(127, "", str(e))
+        except Exception as e:
+            return CommandResult(1, "", str(e))
+
+
+# =============================================================================
+# Persistence (small JSON-backed key/value store)
+# =============================================================================
+
+class StateStore(ABC):
+    """A tiny persistent dict. Implementations decide where bytes live."""
+
+    @abstractmethod
+    def load(self) -> Dict[str, Any]:
+        pass
+
+    @abstractmethod
+    def save(self, data: Dict[str, Any]) -> None:
+        pass
+
+
+class InMemoryStateStore(StateStore):
+    def __init__(self, data: Optional[Dict[str, Any]] = None):
+        self._data: Dict[str, Any] = dict(data or {})
+
+    def load(self) -> Dict[str, Any]:
+        return dict(self._data)
+
+    def save(self, data: Dict[str, Any]) -> None:
+        self._data = dict(data)
+
+
+class JsonFileStore(StateStore):
+    """JSON file store with atomic writes. Missing/corrupt file reads as {}."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def load(self) -> Dict[str, Any]:
+        try:
+            with open(self.path, "r") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def save(self, data: Dict[str, Any]) -> None:
+        tmp_path = f"{self.path}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, self.path)
+
+
+# =============================================================================
+# Interfaces
+# =============================================================================
+
 class PrinterInterface(ABC):
     """Abstract interface for printer operations"""
 
@@ -64,7 +318,15 @@ class PrinterInterface(ABC):
         pass
 
     @abstractmethod
-    def print_file(self, file_path: str) -> bool:
+    def print_file(self, file_path: str, options: PrintOptions) -> PrintResult:
+        pass
+
+    @abstractmethod
+    def list_printers(self) -> List[PrinterInfo]:
+        pass
+
+    @abstractmethod
+    def get_job_state(self, job_id: str) -> JobState:
         pass
 
 
@@ -81,6 +343,10 @@ class FileProcessorInterface(ABC):
 
     @abstractmethod
     def is_pdf(self, file_path: str) -> bool:
+        pass
+
+    @abstractmethod
+    def render_preview(self, file_path: str, output_dir: str) -> Optional[str]:
         pass
 
 
@@ -100,85 +366,177 @@ class AuthManagerInterface(ABC):
         pass
 
 
+class UserSettingsStoreInterface(ABC):
+    """Abstract interface for per-user settings persistence"""
+
+    @abstractmethod
+    def get(self, user_id: int) -> UserSettings:
+        pass
+
+    @abstractmethod
+    def set(self, user_id: int, settings: UserSettings) -> None:
+        pass
+
+
+# =============================================================================
+# Adapters
+# =============================================================================
+
 class SystemPrinter(PrinterInterface):
-    """System printer implementation using CUPS commands"""
+    """System printer implementation using CUPS commands (lp/lpstat/lpq)."""
+
+    def __init__(self, runner: Optional[CommandRunner] = None,
+                 logger: Optional[logging.Logger] = None):
+        self.runner = runner or SubprocessCommandRunner()
+        self.logger = logger or logging.getLogger("printerbot.printer")
 
     def get_status(self) -> PrinterStatus:
-        try:
-            status = os.popen('lpstat -p').read().strip()
-            queue = os.popen('lpq').read().strip()
-            return PrinterStatus(status=status, queue=queue)
-        except Exception as e:
-            return PrinterStatus(status="", queue="", error=str(e))
+        status = self.runner.run(["lpstat", "-p"])
+        queue = self.runner.run(["lpq"])
+        if not status.ok and not queue.ok:
+            return PrinterStatus(status="", queue="", error=(status.stderr or queue.stderr).strip())
+        return PrinterStatus(status=status.stdout.strip(), queue=queue.stdout.strip())
 
     def get_pending_jobs(self) -> JobStatus:
-        try:
-            jobs = os.popen('lpstat -W not-completed').read().strip()
-            return JobStatus(jobs=jobs)
-        except Exception as e:
-            return JobStatus(jobs="", error=str(e))
+        result = self.runner.run(["lpstat", "-W", "not-completed"])
+        if not result.ok:
+            return JobStatus(jobs="", error=result.stderr.strip() or "lpstat failed")
+        return JobStatus(jobs=result.stdout.strip())
 
     def get_completed_jobs(self) -> JobStatus:
-        try:
-            jobs = os.popen('lpstat -W completed | head').read().strip()
-            return JobStatus(jobs=jobs)
-        except Exception as e:
-            return JobStatus(jobs="", error=str(e))
+        result = self.runner.run(["lpstat", "-W", "completed"])
+        if not result.ok:
+            return JobStatus(jobs="", error=result.stderr.strip() or "lpstat failed")
+        lines = result.stdout.strip().splitlines()[:10]
+        return JobStatus(jobs="\n".join(lines))
 
     def cancel_job(self, job_id: str) -> bool:
-        try:
-            result = os.system(f"cancel {job_id}")
-            return result == 0
-        except Exception:
-            return False
+        return self.runner.run(["cancel", job_id]).ok
 
-    def print_file(self, file_path: str) -> bool:
-        try:
-            result = os.system(f'lpr "{file_path}"')
-            return result == 0
-        except Exception:
+    def print_file(self, file_path: str, options: PrintOptions) -> PrintResult:
+        args = ["lp"] + self._options_to_args(options) + [file_path]
+        if options.dry_run:
+            command = " ".join(shlex.quote(a) for a in args)
+            self.logger.info("[DRY RUN] would run: %s", command)
+            return PrintResult(True, None, "Dry run — command logged, nothing printed")
+        result = self.runner.run(args)
+        if result.ok:
+            return PrintResult(True, self._parse_job_id(result.stdout), "Sent to printer")
+        return PrintResult(False, None, result.stderr.strip() or "Failed to send to printer")
+
+    def list_printers(self) -> List[PrinterInfo]:
+        names_result = self.runner.run(["lpstat", "-e"])
+        if not names_result.ok:
+            return []
+        default = self._parse_default_printer(self.runner.run(["lpstat", "-d"]).stdout)
+        return [
+            PrinterInfo(name=name, is_default=(name == default))
+            for name in names_result.stdout.split()
+        ]
+
+    def get_job_state(self, job_id: str) -> JobState:
+        if self._job_listed("not-completed", job_id):
+            return JobState(job_id, JobPhase.PROCESSING)
+        if self._job_listed("completed", job_id):
+            return JobState(job_id, JobPhase.COMPLETED)
+        return JobState(job_id, JobPhase.UNKNOWN)
+
+    # -- internals ----------------------------------------------------------
+
+    def _options_to_args(self, options: PrintOptions) -> List[str]:
+        args: List[str] = []
+        if options.printer:
+            args += ["-d", options.printer]
+        if options.copies and options.copies > 1:
+            args += ["-n", str(options.copies)]
+
+        o_opts = [f"sides={options.duplex.value}", f"media={options.paper_size.value}"]
+        if options.color == ColorMode.GRAYSCALE:
+            o_opts.append("ColorModel=Gray")
+        if options.number_up and options.number_up > 1:
+            o_opts.append(f"number-up={options.number_up}")
+        if options.page_ranges.strip():
+            o_opts.append(f"page-ranges={options.page_ranges.strip()}")
+
+        for opt in o_opts:
+            args += ["-o", opt]
+        return args
+
+    @staticmethod
+    def _parse_job_id(stdout: str) -> Optional[str]:
+        # lp prints e.g. "request id is Office-42 (1 file(s))"
+        match = re.search(r"request id is (\S+)", stdout)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _parse_default_printer(stdout: str) -> Optional[str]:
+        # "system default destination: Office" or "no system default destination"
+        match = re.search(r"system default destination:\s*(\S+)", stdout)
+        return match.group(1) if match else None
+
+    def _job_listed(self, which: str, job_id: str) -> bool:
+        result = self.runner.run(["lpstat", "-W", which, "-o"])
+        if not result.ok:
             return False
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if parts and parts[0] == job_id:
+                return True
+        return False
 
 
 class LibreOfficeFileProcessor(FileProcessorInterface):
-    """File processor using LibreOffice for conversions"""
+    """File processor using LibreOffice / poppler utilities."""
 
-    def __init__(self, timeout: int = 60):
+    def __init__(self, timeout: int = 60, runner: Optional[CommandRunner] = None):
         self.timeout = timeout
+        self.runner = runner or SubprocessCommandRunner()
 
     def convert_to_pdf(self, file_path: str, output_dir: str) -> Tuple[str, bool]:
         if self.is_pdf(file_path):
             return file_path, True
 
-        try:
-            abs_file_path = os.path.abspath(file_path)
-            abs_output_dir = os.path.abspath(output_dir)
+        abs_file_path = os.path.abspath(file_path)
+        abs_output_dir = os.path.abspath(output_dir)
 
-            cmd = f'timeout {self.timeout} libreoffice --headless --convert-to pdf "{abs_file_path}" --outdir "{abs_output_dir}"'
-            result = os.system(cmd)
-
-            if result == 0:
-                base_name = os.path.splitext(os.path.basename(file_path))[0]
-                new_path = os.path.join(output_dir, base_name + '.pdf')
-                if os.path.exists(new_path):
-                    return new_path, True
-
-            return file_path, False
-        except Exception:
-            return file_path, False
+        result = self.runner.run(
+            ["libreoffice", "--headless", "--convert-to", "pdf",
+             abs_file_path, "--outdir", abs_output_dir],
+            timeout=self.timeout,
+        )
+        if result.ok:
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            new_path = os.path.join(output_dir, base_name + ".pdf")
+            if os.path.exists(new_path):
+                return new_path, True
+        return file_path, False
 
     def get_page_count(self, file_path: str) -> int:
-        try:
-            output = os.popen(f'pdfinfo "{file_path}" | grep Pages').read().strip()
-            if output:
-                return int(''.join(filter(str.isdigit, output)))
+        result = self.runner.run(["pdfinfo", file_path])
+        if not result.ok:
             return 0
-        except Exception:
-            return 0
+        for line in result.stdout.splitlines():
+            if line.startswith("Pages:"):
+                digits = "".join(filter(str.isdigit, line))
+                return int(digits) if digits else 0
+        return 0
 
     def is_pdf(self, file_path: str) -> bool:
         _, ext = os.path.splitext(file_path)
         return ext.lower() == ".pdf"
+
+    def render_preview(self, file_path: str, output_dir: str) -> Optional[str]:
+        """Render the first page to a PNG thumbnail. Returns the path or None."""
+        out_base = os.path.join(output_dir, os.path.splitext(os.path.basename(file_path))[0] + "_preview")
+        result = self.runner.run(
+            ["pdftoppm", "-png", "-f", "1", "-l", "1", "-singlefile",
+             "-scale-to", "1000", file_path, out_base],
+            timeout=self.timeout,
+        )
+        out_path = out_base + ".png"
+        if result.ok and os.path.exists(out_path):
+            return out_path
+        return None
 
 
 class InMemoryAuthManager(AuthManagerInterface):
@@ -202,7 +560,7 @@ class InMemoryAuthManager(AuthManagerInterface):
 
 
 class FileAuthManager(AuthManagerInterface):
-    """File-based authentication manager"""
+    """File-based authentication manager (password from file, users in memory)."""
 
     def __init__(self, password_file: str):
         self.password_file = password_file
@@ -229,6 +587,60 @@ class FileAuthManager(AuthManagerInterface):
         return self.correct_password
 
 
+class PersistentAuthManager(AuthManagerInterface):
+    """Authentication manager that persists the authorized-user set in a
+    StateStore so authorizations survive restarts."""
+
+    STORE_KEY = "authorized_users"
+
+    def __init__(self, correct_password: str, store: StateStore):
+        self.correct_password = correct_password
+        self.store = store
+
+    def _load_users(self) -> Set[int]:
+        return set(self.store.load().get(self.STORE_KEY, []))
+
+    def is_authorized(self, user_id: int) -> bool:
+        return user_id in self._load_users()
+
+    def authorize_user(self, user_id: int, password: str) -> bool:
+        if password != self.correct_password:
+            return False
+        data = self.store.load()
+        users = set(data.get(self.STORE_KEY, []))
+        users.add(user_id)
+        data[self.STORE_KEY] = sorted(users)
+        self.store.save(data)
+        return True
+
+    def get_correct_password(self) -> str:
+        return self.correct_password
+
+
+class StoreBackedUserSettings(UserSettingsStoreInterface):
+    """Per-user settings persisted in a StateStore (keyed by user id)."""
+
+    STORE_KEY = "user_settings"
+
+    def __init__(self, store: StateStore):
+        self.store = store
+
+    def get(self, user_id: int) -> UserSettings:
+        bucket = self.store.load().get(self.STORE_KEY, {})
+        raw = bucket.get(str(user_id))
+        return UserSettings.from_dict(raw) if raw else UserSettings()
+
+    def set(self, user_id: int, settings: UserSettings) -> None:
+        data = self.store.load()
+        bucket = data.setdefault(self.STORE_KEY, {})
+        bucket[str(user_id)] = settings.to_dict()
+        self.store.save(data)
+
+
+# =============================================================================
+# Service layer (business logic)
+# =============================================================================
+
 class PrinterBotService:
     """Core business logic for the printer bot"""
 
@@ -238,6 +650,7 @@ class PrinterBotService:
         file_processor: FileProcessorInterface,
         auth_manager: AuthManagerInterface,
         files_dir: str,
+        settings_store: Optional[UserSettingsStoreInterface] = None,
         file_size_limit: int = 64 * 1024 * 1024,
         max_pages_limit: int = 100
     ):
@@ -245,11 +658,14 @@ class PrinterBotService:
         self.file_processor = file_processor
         self.auth_manager = auth_manager
         self.files_dir = files_dir
+        self.settings_store = settings_store or StoreBackedUserSettings(InMemoryStateStore())
         self.file_size_limit = file_size_limit
         self.max_pages_limit = max_pages_limit
 
         # Ensure files directory exists
         pathlib.Path(files_dir).mkdir(parents=True, exist_ok=True)
+
+    # -- printer status -----------------------------------------------------
 
     def get_printer_status(self) -> PrinterStatus:
         return self.printer.get_status()
@@ -260,6 +676,15 @@ class PrinterBotService:
     def get_completed_jobs(self) -> JobStatus:
         return self.printer.get_completed_jobs()
 
+    def list_printers(self) -> List[PrinterInfo]:
+        try:
+            return self.printer.list_printers()
+        except Exception:
+            return []
+
+    def get_job_state(self, job_id: str) -> JobState:
+        return self.printer.get_job_state(job_id)
+
     def cancel_job(self, job_id: str) -> Tuple[bool, str]:
         if not self._is_valid_job_id(job_id):
             return False, f"Invalid job_id '{job_id}'"
@@ -269,6 +694,8 @@ class PrinterBotService:
             return True, f"Job '{job_id}' cancelled successfully"
         else:
             return False, f"Failed to cancel job '{job_id}'"
+
+    # -- auth ---------------------------------------------------------------
 
     def authenticate_user(self, user_id: int, password: str) -> Tuple[bool, str]:
         if self.auth_manager.is_authorized(user_id):
@@ -281,6 +708,19 @@ class PrinterBotService:
 
     def is_user_authorized(self, user_id: int) -> bool:
         return self.auth_manager.is_authorized(user_id)
+
+    # -- per-user settings --------------------------------------------------
+
+    def get_user_settings(self, user_id: int) -> UserSettings:
+        return self.settings_store.get(user_id)
+
+    def update_user_settings(self, user_id: int, settings: UserSettings) -> None:
+        self.settings_store.set(user_id, settings)
+
+    def default_options_for(self, user_id: int) -> PrintOptions:
+        return self.get_user_settings(user_id).default_options
+
+    # -- files --------------------------------------------------------------
 
     def validate_file(self, file_info: FileInfo) -> Tuple[bool, str]:
         if file_info.file_size > self.file_size_limit:
@@ -319,21 +759,32 @@ class PrinterBotService:
         except Exception as e:
             return False, f"Error processing file: {str(e)}", 0, ""
 
-    def print_file(self, file_path: str) -> Tuple[bool, str]:
+    def render_preview(self, file_path: str) -> Optional[str]:
         if not self._is_valid_file_path(file_path):
-            return False, "File not found or invalid path"
+            return None
+        try:
+            return self.file_processor.render_preview(file_path, self.files_dir)
+        except Exception:
+            return None
 
+    def print_file(self, file_path: str, options: Optional[PrintOptions] = None) -> PrintResult:
+        if not self._is_valid_file_path(file_path):
+            return PrintResult(False, None, "File not found or invalid path")
+
+        options = options or PrintOptions()
         try:
             page_count = self.file_processor.get_page_count(file_path)
-            success = self.printer.print_file(file_path)
+            result = self.printer.print_file(file_path, options)
 
-            if success:
-                return True, f"File sent to printer! ({page_count} pages)"
-            else:
-                return False, "Failed to send file to printer"
+            if result.success:
+                summary = self._describe_job(page_count, options)
+                if options.dry_run:
+                    return PrintResult(True, result.job_id, f"🧪 Dry run — command logged, nothing printed {summary}")
+                return PrintResult(True, result.job_id, f"Sent to printer! {summary}")
+            return PrintResult(False, None, result.message or "Failed to send file to printer")
 
         except Exception as e:
-            return False, f"Error processing print request: {str(e)}"
+            return PrintResult(False, None, f"Error processing print request: {str(e)}")
 
     def delete_file(self, file_path: str) -> Tuple[bool, str]:
         if not self._is_valid_file_path(file_path):
@@ -350,6 +801,20 @@ class PrinterBotService:
         _, file_extension = os.path.splitext(original_name)
         return temp_name + (file_extension if file_extension else "")
 
+    # -- internals ----------------------------------------------------------
+
+    @staticmethod
+    def _describe_job(page_count: int, options: PrintOptions) -> str:
+        pages = f"{page_count} page{'s' if page_count != 1 else ''}"
+        parts = [pages]
+        if options.copies > 1:
+            parts.append(f"{options.copies} copies")
+        if options.duplex != Duplex.ONE_SIDED:
+            parts.append("double-sided")
+        if options.color == ColorMode.GRAYSCALE:
+            parts.append("grayscale")
+        return "(" + ", ".join(parts) + ")"
+
     def _is_valid_job_id(self, job_id: str) -> bool:
         return bool(re.match(r'^[a-zA-Z0-9_\-]+$', job_id))
 
@@ -361,7 +826,7 @@ class PrinterBotService:
             return (abs_file_path.startswith(abs_files_dir) and
                     os.path.exists(abs_file_path) and
                     os.path.isfile(abs_file_path))
-        except:
+        except Exception:
             return False
 
     def _cleanup_file(self, processed_path: str, original_path: str):
@@ -370,12 +835,128 @@ class PrinterBotService:
                 os.unlink(processed_path)
             if processed_path != original_path and os.path.exists(original_path):
                 os.unlink(original_path)
-        except:
+        except Exception:
             pass
 
 
+# =============================================================================
+# UI building blocks (pure functions — no Telegram I/O, unit-testable)
+# =============================================================================
+
+# Scopes embedded in callback data so one set of widgets drives both a
+# per-job panel ("j") and the persistent settings panel ("s").
+SCOPE_JOB = "j"
+SCOPE_SETTINGS = "s"
+
+# Bot commands shown in Telegram's "/" menu — single source of truth.
+BOT_COMMANDS: List[Tuple[str, str]] = [
+    ("start", "Show printer status & help"),
+    ("settings", "Edit your default print settings"),
+    ("pending", "Show pending print jobs"),
+    ("completed", "Show recently completed jobs"),
+    ("cancel", "Cancel a job: /cancel <job_id>"),
+]
+
+
+def _next_in_cycle(value, cycle):
+    try:
+        idx = cycle.index(value)
+    except ValueError:
+        return cycle[0]
+    return cycle[(idx + 1) % len(cycle)]
+
+
+def apply_option_action(options: PrintOptions, verb: str,
+                        printer_names: Optional[List[str]] = None) -> PrintOptions:
+    """Pure transition: given current options and a UI verb, return new options."""
+    if verb == "copies_inc":
+        return replace(options, copies=min(MAX_COPIES, options.copies + 1))
+    if verb == "copies_dec":
+        return replace(options, copies=max(1, options.copies - 1))
+    if verb == "duplex":
+        return replace(options, duplex=_next_in_cycle(options.duplex, DUPLEX_CYCLE))
+    if verb == "color":
+        flipped = ColorMode.GRAYSCALE if options.color == ColorMode.COLOR else ColorMode.COLOR
+        return replace(options, color=flipped)
+    if verb == "paper":
+        return replace(options, paper_size=_next_in_cycle(options.paper_size, PAPER_CYCLE))
+    if verb == "nup":
+        return replace(options, number_up=_next_in_cycle(options.number_up, NUP_CYCLE))
+    if verb == "printer":
+        names = printer_names or []
+        if not names:
+            return options
+        current = options.printer if options.printer in names else names[0]
+        return replace(options, printer=_next_in_cycle(current, names))
+    if verb == "dryrun":
+        return replace(options, dry_run=not options.dry_run)
+    return options
+
+
+def _duplex_label(duplex: Duplex) -> str:
+    return {
+        Duplex.ONE_SIDED: "Single-sided",
+        Duplex.TWO_SIDED_LONG: "Double · long edge",
+        Duplex.TWO_SIDED_SHORT: "Double · short edge",
+    }[duplex]
+
+
+def _color_label(color: ColorMode) -> str:
+    return "🌈 Color" if color == ColorMode.COLOR else "⬛ Grayscale"
+
+
+def build_options_keyboard(options: PrintOptions, scope: str, key: str,
+                           printer_names: Optional[List[str]] = None) -> InlineKeyboardMarkup:
+    """Pure render: PrintOptions -> inline keyboard. `scope`/`key` are encoded in
+    every button's callback data as "<verb> <scope>:<key>"."""
+    target = f"{scope}:{key}"
+    copies_word = "copy" if options.copies == 1 else "copies"
+    nup_word = "page" if options.number_up == 1 else "pages"
+    page_label = "All pages" if not options.page_ranges else f"Pages: {options.page_ranges}"
+
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton("➖", callback_data=f"copies_dec {target}"),
+            InlineKeyboardButton(f"{options.copies} {copies_word}", callback_data=f"noop {target}"),
+            InlineKeyboardButton("➕", callback_data=f"copies_inc {target}"),
+        ],
+        [InlineKeyboardButton(f"Sides: {_duplex_label(options.duplex)}", callback_data=f"duplex {target}")],
+        [InlineKeyboardButton(_color_label(options.color), callback_data=f"color {target}")],
+        [InlineKeyboardButton(f"Paper: {options.paper_size.value}", callback_data=f"paper {target}")],
+        [InlineKeyboardButton(f"{options.number_up} {nup_word}/sheet", callback_data=f"nup {target}")],
+        [InlineKeyboardButton(f"📑 {page_label}", callback_data=f"range {target}")],
+    ]
+
+    names = printer_names or []
+    if len(names) > 1:
+        current = options.printer or "default"
+        rows.append([InlineKeyboardButton(f"🖨 Printer: {current}", callback_data=f"printer {target}")])
+
+    if scope == SCOPE_JOB:
+        rows.append([
+            InlineKeyboardButton("🖨️ Print", callback_data=f"print {target}"),
+            InlineKeyboardButton("🗑️ Delete", callback_data=f"delete {target}"),
+        ])
+    else:
+        # Dry run is a mode/preference, so it only appears in the settings panel;
+        # per-file jobs still inherit and honor whatever default is set here.
+        dry_state = "ON" if options.dry_run else "OFF"
+        rows.append([InlineKeyboardButton(f"🧪 Dry run: {dry_state}", callback_data=f"dryrun {target}")])
+        rows.append([InlineKeyboardButton("✅ Done", callback_data=f"done {target}")])
+
+    return InlineKeyboardMarkup(rows)
+
+
+# =============================================================================
+# Telegram bot
+# =============================================================================
+
 class TelegramPrinterBot:
     """Telegram bot wrapper around PrinterBotService"""
+
+    # how long live job-status polling runs: STATUS_POLLS * STATUS_INTERVAL secs
+    STATUS_POLLS = 40
+    STATUS_INTERVAL = 3
 
     def __init__(self, token: str, service: PrinterBotService, logger: logging.Logger):
         self.token = token
@@ -384,16 +965,22 @@ class TelegramPrinterBot:
         self.application = None
 
     def create_application(self) -> Application:
-        self.application = Application.builder().token(self.token).build()
+        self.application = (
+            Application.builder()
+            .token(self.token)
+            .post_init(self._post_init)
+            .build()
+        )
 
-        # Add handlers
+        # Commands
         self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CommandHandler("auth", self.authorize))
         self.application.add_handler(CommandHandler("pending", self.pending))
         self.application.add_handler(CommandHandler("completed", self.completed))
         self.application.add_handler(CommandHandler("cancel", self.cancel))
+        self.application.add_handler(CommandHandler("settings", self.settings))
 
-        # File handlers
+        # Files
         self.application.add_handler(
             MessageHandler(filters.Document.ALL | filters.PHOTO, self.upload_file)
         )
@@ -404,12 +991,22 @@ class TelegramPrinterBot:
 
         return self.application
 
+    async def _post_init(self, application: Application) -> None:
+        try:
+            await application.bot.set_my_commands(
+                [BotCommand(name, desc) for name, desc in BOT_COMMANDS]
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to set command menu: {e}")
+
     def run(self):
         if not self.application:
             self.create_application()
 
         self.logger.info("🤖 Telegram Printer Bot starting...")
         self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # -- helpers ------------------------------------------------------------
 
     def _get_user_id(self, update: Update) -> Optional[int]:
         if update.message:
@@ -429,11 +1026,29 @@ class TelegramPrinterBot:
     async def _request_auth(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please authorize by \"/auth <password>\".")
 
-    async def _update_message(self, context: CallbackContext, msg: telegram.Message, text: str):
+    async def _update_message(self, context: CallbackContext, msg, text: str):
         try:
             await context.bot.edit_message_text(text, msg.chat.id, msg.message_id)
         except Exception as e:
             self.logger.error(f"Error updating message: {e}")
+
+    async def _edit_panel(self, query, text: str, reply_markup=None):
+        """Edit a panel message whether it is a text message or a photo (caption)."""
+        try:
+            if query.message and query.message.photo:
+                await query.edit_message_caption(caption=text, reply_markup=reply_markup)
+            else:
+                await query.edit_message_text(text=text, reply_markup=reply_markup)
+        except Exception as e:
+            self.logger.error(f"Error editing panel: {e}")
+
+    def _job_registry(self, context: CallbackContext) -> Dict[str, Any]:
+        return context.user_data.setdefault("jobs", {})
+
+    def _printer_names(self) -> List[str]:
+        return [p.name for p in self.service.list_printers()]
+
+    # -- command handlers ---------------------------------------------------
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = self._get_user_id(update)
@@ -502,6 +1117,21 @@ class TelegramPrinterBot:
         else:
             await update.message.reply_text(f"❌ {message}")
 
+    async def settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = self._get_user_id(update)
+        username = self._get_username(update)
+        self.logger.info(f"User {username} (ID: {user_id}) /settings request")
+
+        if not self.service.is_user_authorized(user_id):
+            return await self._request_auth(update, context)
+
+        options = self.service.default_options_for(user_id)
+        keyboard = build_options_keyboard(options, SCOPE_SETTINGS, "_", self._printer_names())
+        await update.message.reply_text(
+            "⚙️ Your default print settings (applied to every new file):",
+            reply_markup=keyboard,
+        )
+
     async def authorize(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = self._get_user_id(update)
         username = self._get_username(update)
@@ -527,9 +1157,14 @@ class TelegramPrinterBot:
         if not self.service.is_user_authorized(user_id):
             return await self._request_auth(update, context)
 
+        # If we're waiting for a typed page range, consume this message as the range.
+        if context.user_data.get("awaiting_range"):
+            return await self._handle_range_input(update, context)
+
         await update.message.reply_text("📄 Please send a document or image file to print.\n\n"
                                       "Available commands:\n"
                                       "• `/start` - Show printer status\n"
+                                      "• `/settings` - Default print settings\n"
                                       "• `/pending` - Show pending jobs\n"
                                       "• `/completed` - Show completed jobs\n"
                                       "• `/cancel <job_id>` - Cancel a print job")
@@ -581,22 +1216,49 @@ class TelegramPrinterBot:
             # Delete status message
             try:
                 await context.bot.delete_message(reply_msg.chat.id, reply_msg.message_id)
-            except:
+            except Exception:
                 pass
 
-            # Create response with buttons
-            keyboard = [
-                [telegram.InlineKeyboardButton("🖨️ Print", callback_data=f"print {processed_path}")],
-                [telegram.InlineKeyboardButton("🗑️ Delete", callback_data=f"delete {processed_path}")],
-            ]
-            reply_markup = telegram.InlineKeyboardMarkup(keyboard)
-
-            page_text = f"{page_count} page{'s' if page_count != 1 else ''}"
-            await update.message.reply_text(f"📄 Ready to print: {page_text}", reply_markup=reply_markup)
+            await self._present_print_panel(update, context, user_id, processed_path, page_count)
 
         except Exception as e:
             self.logger.error(f"Error processing file: {e}")
             await self._update_message(context, reply_msg, f"❌ Error processing file: {str(e)}")
+
+    async def _present_print_panel(self, update, context, user_id, processed_path, page_count):
+        """Register the job and show the interactive options panel (with preview)."""
+        options = self.service.default_options_for(user_id)
+        printer_names = self._printer_names()
+
+        token = secrets.token_hex(4)
+        self._job_registry(context)[token] = {
+            "file_path": processed_path,
+            "page_count": page_count,
+            "options": options,
+            "printers": printer_names,
+        }
+
+        keyboard = build_options_keyboard(options, SCOPE_JOB, token, printer_names)
+        page_text = f"{page_count} page{'s' if page_count != 1 else ''}"
+        caption = f"📄 Ready to print: {page_text}\nChoose options, then press Print."
+
+        preview_path = self.service.render_preview(processed_path)
+        if preview_path:
+            try:
+                with open(preview_path, "rb") as preview:
+                    await update.message.reply_photo(preview, caption=caption, reply_markup=keyboard)
+                return
+            except Exception as e:
+                self.logger.error(f"Error sending preview: {e}")
+            finally:
+                try:
+                    os.unlink(preview_path)
+                except OSError:
+                    pass
+
+        await update.message.reply_text(caption, reply_markup=keyboard)
+
+    # -- callback routing ---------------------------------------------------
 
     async def button(self, update: Update, context: CallbackContext):
         query = update.callback_query
@@ -611,25 +1273,198 @@ class TelegramPrinterBot:
 
         await query.answer()
 
-        try:
-            cmd, file_path = query.data.split(' ', 1)
-        except ValueError:
-            await self._update_message(context, query.message, "❌ Invalid button data")
+        verb, _, rest = query.data.partition(" ")
+
+        if verb == "noop":
+            return
+        if verb == "cancel":
+            return await self._handle_cancel_button(query, rest.strip())
+
+        scope, _, key = rest.partition(":")
+        if scope not in (SCOPE_JOB, SCOPE_SETTINGS):
+            await self._edit_panel(query, "❌ Invalid button data")
             return
 
-        if cmd == 'delete':
-            success, message = self.service.delete_file(file_path)
-            emoji = "🗑️" if success else "❌"
-            await self._update_message(context, query.message, f"{emoji} {message}")
-        elif cmd == 'print':
-            success, message = self.service.print_file(file_path)
-            emoji = "🖨️" if success else "❌"
-            await self._update_message(context, query.message, f"{emoji} {message}")
-
-            if success:
-                self.logger.info(f"Successfully sent {file_path} to printer for user {username} (ID: {user_id})")
+        if scope == SCOPE_JOB:
+            await self._handle_job_button(query, context, verb, key, user_id)
         else:
-            await self._update_message(context, query.message, "❌ Unknown command")
+            await self._handle_settings_button(query, context, verb, key, user_id)
+
+    async def _handle_cancel_button(self, query, job_id: str):
+        success, message = self.service.cancel_job(job_id)
+        emoji = "🚫" if success else "❌"
+        await self._edit_panel(query, f"{emoji} {message}")
+
+    async def _handle_job_button(self, query, context, verb, token, user_id):
+        registry = self._job_registry(context)
+        entry = registry.get(token)
+        if not entry:
+            await self._edit_panel(query, "⌛ This file is no longer available. Please re-send it.")
+            return
+
+        if verb == "delete":
+            success, message = self.service.delete_file(entry["file_path"])
+            registry.pop(token, None)
+            await self._edit_panel(query, f"{'🗑️' if success else '❌'} {message}")
+            return
+
+        if verb == "print":
+            result = self.service.print_file(entry["file_path"], entry["options"])
+            registry.pop(token, None)
+            if not result.success:
+                await self._edit_panel(query, f"❌ {result.message}")
+                return
+            await self._start_live_status(query, context, result, entry["page_count"])
+            return
+
+        if verb == "range":
+            await self._prompt_for_range(query, context, SCOPE_JOB, token)
+            return
+
+        # An option mutation: update the registry entry and re-render.
+        entry["options"] = apply_option_action(entry["options"], verb, entry.get("printers"))
+        await self._rerender_keyboard(query, entry["options"], SCOPE_JOB, token, entry.get("printers"))
+
+    async def _handle_settings_button(self, query, context, verb, key, user_id):
+        settings = self.service.get_user_settings(user_id)
+        options = settings.default_options
+        printer_names = self._printer_names()
+
+        if verb == "done":
+            await self._edit_panel(query, "✅ Settings saved. They'll apply to every new file.")
+            return
+
+        if verb == "range":
+            await self._prompt_for_range(query, context, SCOPE_SETTINGS, key)
+            return
+
+        new_options = apply_option_action(options, verb, printer_names)
+        self.service.update_user_settings(user_id, replace(settings, default_options=new_options))
+        await self._rerender_keyboard(query, new_options, SCOPE_SETTINGS, key, printer_names)
+
+    async def _rerender_keyboard(self, query, options, scope, key, printer_names):
+        keyboard = build_options_keyboard(options, scope, key, printer_names)
+        try:
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+        except Exception as e:
+            self.logger.error(f"Error re-rendering keyboard: {e}")
+
+    # -- page-range typed input ---------------------------------------------
+
+    async def _prompt_for_range(self, query, context, scope, key):
+        context.user_data["awaiting_range"] = {
+            "scope": scope,
+            "key": key,
+            "chat_id": query.message.chat.id,
+            "message_id": query.message.message_id,
+        }
+        await context.bot.send_message(
+            query.message.chat.id,
+            "📑 Send the page range to print, e.g. `2-5` or `1,3,5` — or `all` for every page.",
+            parse_mode="Markdown",
+        )
+
+    async def _handle_range_input(self, update: Update, context: CallbackContext):
+        pending = context.user_data.pop("awaiting_range")
+        raw = (update.message.text or "").strip()
+
+        if raw.lower() in ("all", "*", ""):
+            page_ranges = ""
+        elif re.match(r'^[0-9]+(?:-[0-9]+)?(?:\s*,\s*[0-9]+(?:-[0-9]+)?)*$', raw):
+            page_ranges = re.sub(r'\s+', '', raw)
+        else:
+            await update.message.reply_text("❌ Invalid range. Use e.g. `2-5` or `1,3,5` or `all`.", parse_mode="Markdown")
+            return
+
+        scope, key = pending["scope"], pending["key"]
+        user_id = self._get_user_id(update)
+
+        if scope == SCOPE_JOB:
+            entry = self._job_registry(context).get(key)
+            if not entry:
+                await update.message.reply_text("⌛ This file is no longer available. Please re-send it.")
+                return
+            entry["options"] = replace(entry["options"], page_ranges=page_ranges)
+            options, printer_names = entry["options"], entry.get("printers")
+        else:
+            settings = self.service.get_user_settings(user_id)
+            options = replace(settings.default_options, page_ranges=page_ranges)
+            self.service.update_user_settings(user_id, replace(settings, default_options=options))
+            printer_names = self._printer_names()
+
+        # Re-render the original panel's keyboard in place.
+        keyboard = build_options_keyboard(options, scope, key, printer_names)
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=pending["chat_id"],
+                message_id=pending["message_id"],
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            self.logger.error(f"Error updating panel after range input: {e}")
+
+        label = "all pages" if not page_ranges else f"pages {page_ranges}"
+        await update.message.reply_text(f"✅ Will print {label}.")
+
+    # -- live job status ----------------------------------------------------
+
+    async def _start_live_status(self, query, context, result: PrintResult, page_count):
+        is_photo = bool(query.message and query.message.photo)
+        chat_id = query.message.chat.id
+        message_id = query.message.message_id
+
+        if not result.job_id:
+            await self._edit_panel(query, f"🖨️ {result.message}")
+            return
+
+        cancel_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🚫 Cancel", callback_data=f"cancel {result.job_id}")]]
+        )
+        await self._edit_panel(query, f"🖨️ {result.message}\nJob `{result.job_id}` queued…", cancel_kb)
+
+        # Poll the job state in the background and reflect transitions.
+        context.application.create_task(
+            self._poll_job_status(context, chat_id, message_id, result.job_id, page_count, is_photo)
+        )
+
+    async def _poll_job_status(self, context, chat_id, message_id, job_id, page_count, is_photo):
+        seen_active = False
+        cancel_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🚫 Cancel", callback_data=f"cancel {job_id}")]]
+        )
+        try:
+            for _ in range(self.STATUS_POLLS):
+                await asyncio.sleep(self.STATUS_INTERVAL)
+                state = self.service.get_job_state(job_id)
+
+                if state.phase == JobPhase.COMPLETED:
+                    await self._edit_by_id(context, chat_id, message_id, is_photo,
+                                           f"✅ Printed {page_count} page(s) — job {job_id}")
+                    return
+                if state.phase in (JobPhase.PROCESSING, JobPhase.PENDING):
+                    if not seen_active:
+                        seen_active = True
+                        await self._edit_by_id(context, chat_id, message_id, is_photo,
+                                               f"🖨️ Printing… job {job_id}", cancel_kb)
+                elif state.phase == JobPhase.UNKNOWN and seen_active:
+                    await self._edit_by_id(context, chat_id, message_id, is_photo,
+                                           f"✅ Finished — job {job_id}")
+                    return
+        except Exception as e:
+            self.logger.error(f"Error polling job status: {e}")
+
+    async def _edit_by_id(self, context, chat_id, message_id, is_photo, text, reply_markup=None):
+        try:
+            if is_photo:
+                await context.bot.edit_message_caption(
+                    chat_id=chat_id, message_id=message_id, caption=text, reply_markup=reply_markup)
+            else:
+                await context.bot.edit_message_text(
+                    text, chat_id, message_id, reply_markup=reply_markup)
+        except Exception as e:
+            self.logger.debug(f"Status edit skipped: {e}")
+
+    # -- file extraction ----------------------------------------------------
 
     def _extract_file_info(self, message) -> Optional[FileInfo]:
         if message.document:
@@ -649,6 +1484,10 @@ class TelegramPrinterBot:
             )
         return None
 
+
+# =============================================================================
+# Wiring
+# =============================================================================
 
 def setup_logging() -> logging.Logger:
     """Setup logging configuration"""
@@ -673,19 +1512,26 @@ def main() -> None:
     token_path = "./token"
     password_path = "./auth_password"
     files_dir = "printed_files"
+    state_path = "./state.json"
 
     try:
         # Read configuration
         with open(token_path, "r") as f:
             token = f.read().strip()
+        with open(password_path, "r") as f:
+            password = f.read().strip()
 
         # Setup logging
         logger = setup_logging()
 
+        # Persistent state shared by auth + user settings.
+        state_store = JsonFileStore(state_path)
+
         # Create service components
-        printer = SystemPrinter()
+        printer = SystemPrinter(logger=logger)
         file_processor = LibreOfficeFileProcessor()
-        auth_manager = FileAuthManager(password_path)
+        auth_manager = PersistentAuthManager(password, state_store)
+        settings_store = StoreBackedUserSettings(state_store)
 
         # Create service
         service = PrinterBotService(
@@ -693,6 +1539,7 @@ def main() -> None:
             file_processor=file_processor,
             auth_manager=auth_manager,
             files_dir=files_dir,
+            settings_store=settings_store,
             file_size_limit=64 * 1024 * 1024,
             max_pages_limit=100
         )

@@ -6,3 +6,7 @@ printed_files
 printerbot.log
 *.log*
 __pycache__
+state.json
+state.json.tmp
+.venv
+.pytest_cache
