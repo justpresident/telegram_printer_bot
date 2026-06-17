@@ -8,8 +8,10 @@ import re
 import secrets
 import shlex
 import subprocess
+import threading
 import time
 import asyncio
+import fcntl
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple, Set, Dict, Any, List
@@ -249,7 +251,11 @@ class SubprocessCommandRunner(CommandRunner):
 # =============================================================================
 
 class StateStore(ABC):
-    """A tiny persistent dict. Implementations decide where bytes live."""
+    """A tiny persistent dict. Implementations decide where bytes live.
+
+    `update()` performs an atomic read-modify-write so that independent users
+    of the same store (e.g. auth + settings) can't clobber each other's keys.
+    """
 
     @abstractmethod
     def load(self) -> Dict[str, Any]:
@@ -259,10 +265,17 @@ class StateStore(ABC):
     def save(self, data: Dict[str, Any]) -> None:
         pass
 
+    @abstractmethod
+    def update(self, mutator) -> Any:
+        """Atomically load the data, pass it to `mutator(data)` (which mutates
+        the dict in place), persist it, and return whatever the mutator returns."""
+        pass
+
 
 class InMemoryStateStore(StateStore):
     def __init__(self, data: Optional[Dict[str, Any]] = None):
         self._data: Dict[str, Any] = dict(data or {})
+        self._lock = threading.Lock()
 
     def load(self) -> Dict[str, Any]:
         return dict(self._data)
@@ -270,12 +283,20 @@ class InMemoryStateStore(StateStore):
     def save(self, data: Dict[str, Any]) -> None:
         self._data = dict(data)
 
+    def update(self, mutator) -> Any:
+        with self._lock:
+            data = dict(self._data)
+            result = mutator(data)
+            self._data = dict(data)
+            return result
+
 
 class JsonFileStore(StateStore):
     """JSON file store with atomic writes. Missing/corrupt file reads as {}."""
 
     def __init__(self, path: str):
         self.path = path
+        self._lock = threading.Lock()  # guards same-process threads
 
     def load(self) -> Dict[str, Any]:
         try:
@@ -292,6 +313,21 @@ class JsonFileStore(StateStore):
         with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp_path, self.path)
+
+    def update(self, mutator) -> Any:
+        # In-process threads serialize on the lock; separate processes serialize
+        # on an exclusive flock over a sidecar lock file. Together these make the
+        # load-modify-save sequence atomic.
+        with self._lock:
+            with open(self.path + ".lock", "w") as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                try:
+                    data = self.load()
+                    result = mutator(data)
+                    self.save(data)
+                    return result
+                finally:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 # =============================================================================
@@ -606,11 +642,13 @@ class PersistentAuthManager(AuthManagerInterface):
     def authorize_user(self, user_id: int, password: str) -> bool:
         if password != self.correct_password:
             return False
-        data = self.store.load()
-        users = set(data.get(self.STORE_KEY, []))
-        users.add(user_id)
-        data[self.STORE_KEY] = sorted(users)
-        self.store.save(data)
+
+        def mutate(data):
+            users = set(data.get(self.STORE_KEY, []))
+            users.add(user_id)
+            data[self.STORE_KEY] = sorted(users)
+
+        self.store.update(mutate)
         return True
 
     def get_correct_password(self) -> str:
@@ -631,10 +669,11 @@ class StoreBackedUserSettings(UserSettingsStoreInterface):
         return UserSettings.from_dict(raw) if raw else UserSettings()
 
     def set(self, user_id: int, settings: UserSettings) -> None:
-        data = self.store.load()
-        bucket = data.setdefault(self.STORE_KEY, {})
-        bucket[str(user_id)] = settings.to_dict()
-        self.store.save(data)
+        def mutate(data):
+            bucket = data.setdefault(self.STORE_KEY, {})
+            bucket[str(user_id)] = settings.to_dict()
+
+        self.store.update(mutate)
 
 
 # =============================================================================
@@ -992,6 +1031,8 @@ class TelegramPrinterBot:
     # how long live job-status polling runs: STATUS_POLLS * STATUS_INTERVAL secs
     STATUS_POLLS = 40
     STATUS_INTERVAL = 3
+    # how often the background sweep removes stale files from files_dir
+    CLEANUP_INTERVAL = 3600
 
     def __init__(self, token: str, service: PrinterBotService, logger: logging.Logger):
         self.token = token
@@ -1033,6 +1074,19 @@ class TelegramPrinterBot:
             )
         except Exception as e:
             self.logger.error(f"Failed to set command menu: {e}")
+        # Periodically sweep abandoned files (the startup sweep in main() only
+        # runs once; this bounds disk use during a long-lived session).
+        application.create_task(self._periodic_cleanup())
+
+    async def _periodic_cleanup(self) -> None:
+        while True:
+            await asyncio.sleep(self.CLEANUP_INTERVAL)
+            try:
+                removed = await self._offload(self.service.cleanup_stale_files)
+                if removed:
+                    self.logger.info(f"Periodic cleanup removed {removed} stale file(s)")
+            except Exception as e:
+                self.logger.error(f"Periodic cleanup failed: {e}")
 
     def run(self):
         if not self.application:
@@ -1080,8 +1134,15 @@ class TelegramPrinterBot:
     def _job_registry(self, context: CallbackContext) -> Dict[str, Any]:
         return context.user_data.setdefault("jobs", {})
 
-    def _printer_names(self) -> List[str]:
-        return [p.name for p in self.service.list_printers()]
+    @staticmethod
+    async def _offload(func, *args):
+        """Run a blocking (subprocess-bound) service call off the event loop so
+        the single asyncio loop stays responsive during conversions/printing."""
+        return await asyncio.to_thread(func, *args)
+
+    async def _printer_names(self) -> List[str]:
+        printers = await self._offload(self.service.list_printers)
+        return [p.name for p in printers]
 
     # -- command handlers ---------------------------------------------------
 
@@ -1093,7 +1154,7 @@ class TelegramPrinterBot:
         if not self.service.is_user_authorized(user_id):
             return await self._request_auth(update, context)
 
-        status = self.service.get_printer_status()
+        status = await self._offload(self.service.get_printer_status)
         if status.error:
             await update.message.reply_text("🖨️ You are authorized to print! Just send a file here.")
         else:
@@ -1110,7 +1171,7 @@ class TelegramPrinterBot:
         if not self.service.is_user_authorized(user_id):
             return await self._request_auth(update, context)
 
-        jobs = self.service.get_pending_jobs()
+        jobs = await self._offload(self.service.get_pending_jobs)
         if jobs.error:
             await update.message.reply_text("❌ Error checking pending jobs")
         else:
@@ -1125,7 +1186,7 @@ class TelegramPrinterBot:
         if not self.service.is_user_authorized(user_id):
             return await self._request_auth(update, context)
 
-        jobs = self.service.get_completed_jobs()
+        jobs = await self._offload(self.service.get_completed_jobs)
         if jobs.error:
             await update.message.reply_text("❌ Error checking completed jobs")
         else:
@@ -1146,7 +1207,7 @@ class TelegramPrinterBot:
 
         # A job id is a single token (e.g. "Office-42"); use the first arg only.
         job_id = context.args[0].strip()
-        success, message = self.service.cancel_job(job_id)
+        success, message = await self._offload(self.service.cancel_job, job_id)
 
         if success:
             await update.message.reply_text(f"✅ {message}")
@@ -1162,7 +1223,7 @@ class TelegramPrinterBot:
             return await self._request_auth(update, context)
 
         options = self.service.default_options_for(user_id)
-        keyboard = build_options_keyboard(options, SCOPE_SETTINGS, "_", self._printer_names())
+        keyboard = build_options_keyboard(options, SCOPE_SETTINGS, "_", await self._printer_names())
         await update.message.reply_text(
             "⚙️ Your default print settings (applied to every new file):",
             reply_markup=keyboard,
@@ -1243,7 +1304,7 @@ class TelegramPrinterBot:
 
             # Process file
             await self._update_message(context, reply_msg, "🔄 Processing file...")
-            success, message, page_count, processed_path = self.service.process_file(file_path)
+            success, message, page_count, processed_path = await self._offload(self.service.process_file, file_path)
 
             if not success:
                 await self._update_message(context, reply_msg, f"❌ {message}")
@@ -1264,7 +1325,7 @@ class TelegramPrinterBot:
     async def _present_print_panel(self, update, context, user_id, processed_path, page_count):
         """Register the job and show the interactive options panel (with preview)."""
         options = self.service.default_options_for(user_id)
-        printer_names = self._printer_names()
+        printer_names = await self._printer_names()
 
         token = secrets.token_hex(4)
         self._job_registry(context)[token] = {
@@ -1278,7 +1339,7 @@ class TelegramPrinterBot:
         page_text = f"{page_count} page{'s' if page_count != 1 else ''}"
         caption = f"📄 Ready to print: {page_text}\nChoose options, then press Print."
 
-        preview_path = self.service.render_preview(processed_path)
+        preview_path = await self._offload(self.service.render_preview, processed_path)
         if preview_path:
             try:
                 with open(preview_path, "rb") as preview:
@@ -1327,7 +1388,7 @@ class TelegramPrinterBot:
             await self._handle_settings_button(query, context, verb, key, user_id)
 
     async def _handle_cancel_button(self, query, job_id: str):
-        success, message = self.service.cancel_job(job_id)
+        success, message = await self._offload(self.service.cancel_job, job_id)
         emoji = "🚫" if success else "❌"
         await self._edit_panel(query, f"{emoji} {message}")
 
@@ -1345,7 +1406,7 @@ class TelegramPrinterBot:
             return
 
         if verb == "print":
-            result = self.service.print_file(entry["file_path"], entry["options"])
+            result = await self._offload(self.service.print_file, entry["file_path"], entry["options"])
             registry.pop(token, None)
             if not result.success:
                 await self._edit_panel(query, f"❌ {result.message}")
@@ -1364,7 +1425,7 @@ class TelegramPrinterBot:
     async def _handle_settings_button(self, query, context, verb, key, user_id):
         settings = self.service.get_user_settings(user_id)
         options = settings.default_options
-        printer_names = self._printer_names()
+        printer_names = await self._printer_names()
 
         if verb == "done":
             await self._edit_panel(query, "✅ Settings saved. They'll apply to every new file.")
@@ -1430,7 +1491,7 @@ class TelegramPrinterBot:
             settings = self.service.get_user_settings(user_id)
             options = replace(settings.default_options, page_ranges=page_ranges)
             self.service.update_user_settings(user_id, replace(settings, default_options=options))
-            printer_names = self._printer_names()
+            printer_names = await self._printer_names()
 
         # Re-render the original panel's keyboard in place.
         keyboard = build_options_keyboard(options, scope, key, printer_names)
@@ -1477,7 +1538,7 @@ class TelegramPrinterBot:
         try:
             for _ in range(self.STATUS_POLLS):
                 await asyncio.sleep(self.STATUS_INTERVAL)
-                state = self.service.get_job_state(job_id)
+                state = await self._offload(self.service.get_job_state, job_id)
 
                 if state.phase == JobPhase.COMPLETED:
                     await self._edit_by_id(context, chat_id, message_id, is_photo,

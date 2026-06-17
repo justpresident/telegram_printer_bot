@@ -389,6 +389,26 @@ class TestJsonFileStore:
             f.write("{not json")
         assert JsonFileStore(self.path).load() == {}
 
+    def test_update_is_atomic_read_modify_write(self):
+        store = JsonFileStore(self.path)
+        store.update(lambda d: d.update({"a": 1}))
+        store.update(lambda d: d.update({"b": 2}))  # must preserve "a"
+        assert store.load() == {"a": 1, "b": 2}
+
+
+class TestSharedStoreNoClobber:
+    def test_auth_and_settings_share_store_without_clobbering(self):
+        store = InMemoryStateStore()
+        auth = PersistentAuthManager("pw", store)
+        settings = StoreBackedUserSettings(store)
+        # Interleave writes through the SAME store.
+        auth.authorize_user(111, "pw")
+        settings.set(111, UserSettings(PrintOptions(copies=3)))
+        auth.authorize_user(222, "pw")
+        # Both managers' data survives.
+        assert auth.is_authorized(111) and auth.is_authorized(222)
+        assert settings.get(111).default_options.copies == 3
+
 
 class TestPersistentAuthManager:
     def test_authorize_persists_across_instances(self):
