@@ -45,26 +45,46 @@ applies to every file you print until you turn it off.
  * Uses the `python-telegram-bot` package to interface with the Telegram API
 
 ## Architecture
-The code is organized into small, single-responsibility layers, each behind an interface so it
-can be swapped or tested in isolation:
+The code is a small `printerbot/` package, split into single-responsibility modules, each
+collaborator behind an interface so it can be swapped or tested in isolation:
 
- * **Domain types** — `PrintOptions`, `PrintResult`, `JobState`, `UserSettings`, …
- * **`CommandRunner`** — the single seam for running external commands (no shell, captures output)
- * **`StateStore`** — tiny persistent key/value store (`JsonFileStore` / `InMemoryStateStore`)
- * **Adapters** — `SystemPrinter` (CUPS), `LibreOfficeFileProcessor`, auth + settings stores
- * **`PrinterBotService`** — backend-agnostic business logic
- * **`TelegramPrinterBot`** — Telegram I/O; the keyboard/option logic lives in pure functions
-   (`build_options_keyboard`, `apply_option_action`) that are unit-tested without Telegram
+| Module | Responsibility |
+| --- | --- |
+| `domain.py` | Plain data types — `PrintOptions`, `PrintResult`, `JobState`, `UserSettings`, enums |
+| `commands.py` | `CommandRunner` — the single seam for external commands (no shell, captures output) |
+| `storage.py` | `StateStore` — persistent key/value store with atomic `update()` (`JsonFileStore` / `InMemoryStateStore`) |
+| `interfaces.py` | Abstract `PrinterInterface`, `FileProcessorInterface`, `AuthManagerInterface`, `UserSettingsStoreInterface` |
+| `adapters.py` | `SystemPrinter` (CUPS), `LibreOfficeFileProcessor`, auth + settings stores |
+| `service.py` | `PrinterBotService` — backend-agnostic business logic |
+| `ui.py` | Pure keyboard/option logic (`build_options_keyboard`, `apply_option_action`) — unit-tested without Telegram |
+| `bot.py` | `TelegramPrinterBot` — Telegram I/O; offloads blocking work off the event loop |
+| `app.py` | `setup_logging` + `main` wiring |
+
+`printerbot/__init__.py` re-exports the public API, so `from printerbot import …` works from anywhere.
 
 # Install Dependencies
 
-* Python packages: `pip3 install python-telegram-bot`
+* Python 3.11+ and the `python-telegram-bot` package: `pip3 install python-telegram-bot`
 * LibreOffice and poppler-utils (`pdftoppm`, `pdfinfo`). Install with your package manager,
   e.g. `apt install libreoffice poppler-utils`
 * CUPS, with at least one configured printer (`lp`, `lpstat`, `cancel`)
+
+# Running the bot
+Put your bot token in `./token` and the shared password in `./auth_password`, then run from the
+project directory:
+```
+python3 -m printerbot
+```
+A `printerbot.service` systemd unit is included for running it as a service.
 
 # Running the tests
 ```
 pip3 install pytest pytest-asyncio
 python3 -m pytest tests.py -v
+```
+
+To measure coverage (as CI does):
+```
+pip3 install pytest-cov
+python3 -m pytest tests.py --cov=printerbot --cov-report=term-missing
 ```

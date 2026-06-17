@@ -45,3 +45,7 @@
 {"seq":45,"timestamp":"2026-06-17T22:50:51.873691552Z","op":"Update","task_id":"pb-td-blocking-cups","status":"closed"}
 {"seq":46,"timestamp":"2026-06-17T22:50:51.880855486Z","op":"Update","task_id":"pb-td-shared-store-race","status":"closed"}
 {"seq":47,"timestamp":"2026-06-17T22:50:51.887842382Z","op":"Update","task_id":"pb-td-job-registry-gc","status":"closed"}
+{"seq":48,"timestamp":"2026-06-17T22:54:26.086193352Z","op":"Update","task_id":"pb-td-module-split","status":"closed"}
+{"seq":49,"timestamp":"2026-06-17T22:55:03.784583227Z","op":"Create","task_id":"pb-final-deep-review","notes":"Goal: after ALL other work is done (features, tech-debt, review fixes, README, CI, coverage badge, package split), run one more thorough deep review of the entire package and CI. Independent adversarial pass + manual read. Verify: no regressions from the module split or async/locking changes; CI workflow is correct; coverage badge generation is reproducible; README matches reality; all tests pass; pyflakes clean. Fix anything found.","status":"todo","task_type":"task","title":"Final deep review after everything is complete"}
+{"seq":50,"timestamp":"2026-06-17T22:55:03.792335844Z","op":"AddEdge","task_id":"pb-final-deep-review","rel":"depends_on","target":"pb-coverage-badge"}
+{"seq":51,"timestamp":"2026-06-17T22:55:03.800255221Z","op":"Update","task_id":"pb-readme-final","status":"closed"}
