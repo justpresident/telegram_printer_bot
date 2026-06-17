@@ -8,18 +8,18 @@ from .domain import (
     FileType, FileInfo, PrinterStatus, JobStatus,
     Duplex, ColorMode, PaperSize,
     DUPLEX_CYCLE, PAPER_CYCLE, NUP_CYCLE, MAX_COPIES,
-    PrintOptions, PrintResult, PrinterInfo, JobPhase, JobState, UserSettings,
+    PrintOptions, PrintResult, PrinterInfo, JobPhase, JobState, printer_key,
 )
 from .commands import CommandResult, CommandRunner, SubprocessCommandRunner
 from .storage import StateStore, InMemoryStateStore, JsonFileStore
 from .interfaces import (
     PrinterInterface, FileProcessorInterface, AuthManagerInterface,
-    UserSettingsStoreInterface,
+    PrinterSettingsStoreInterface,
 )
 from .adapters import (
     SystemPrinter, LibreOfficeFileProcessor,
     InMemoryAuthManager, FileAuthManager, PersistentAuthManager,
-    StoreBackedUserSettings,
+    StoreBackedPrinterSettings,
 )
 from .service import PrinterBotService
 from .ui import (
@@ -34,14 +34,14 @@ __all__ = [
     "FileType", "FileInfo", "PrinterStatus", "JobStatus",
     "Duplex", "ColorMode", "PaperSize",
     "DUPLEX_CYCLE", "PAPER_CYCLE", "NUP_CYCLE", "MAX_COPIES",
-    "PrintOptions", "PrintResult", "PrinterInfo", "JobPhase", "JobState", "UserSettings",
+    "PrintOptions", "PrintResult", "PrinterInfo", "JobPhase", "JobState", "printer_key",
     "CommandResult", "CommandRunner", "SubprocessCommandRunner",
     "StateStore", "InMemoryStateStore", "JsonFileStore",
     "PrinterInterface", "FileProcessorInterface", "AuthManagerInterface",
-    "UserSettingsStoreInterface",
+    "PrinterSettingsStoreInterface",
     "SystemPrinter", "LibreOfficeFileProcessor",
     "InMemoryAuthManager", "FileAuthManager", "PersistentAuthManager",
-    "StoreBackedUserSettings",
+    "StoreBackedPrinterSettings",
     "PrinterBotService",
     "fenced_block", "apply_option_action", "apply_field_choice", "field_choices",
     "build_options_keyboard", "build_submenu_keyboard",

@@ -14,7 +14,7 @@ After printing, the message keeps you posted on the job's progress and offers a 
 ## Commands:
  * `/start` - Starts interaction and prints current state
  * `/auth <password>` - Authenticates the user with a password against the password stored in the `auth_password` file
- * `/settings` - Opens a panel to edit your **default** print options (applied to every new file)
+ * `/settings` - Edit the **per-printer** default print options (see below)
  * `/pending` - Lists all pending print jobs
  * `/completed` - Lists last 10 completed print jobs
  * `/cancel <job_id>` - Cancels a pending job with a given id
@@ -35,17 +35,23 @@ panel:
  * **Page range** — type e.g. `2-5` or `1,3,5`, or `all`
  * **Printer** — when more than one CUPS printer is available, pick the target (or "System default")
 
-Per-file choices start from your saved `/settings` defaults and can be tweaked just for that file.
+### Per-printer defaults
+Saved defaults are kept **per printer**, not per user — each printer (and "System default") has its
+own remembered options, since e.g. a duplex laser and a single-sided photo printer want different
+settings. `/settings` opens the defaults for your system-default printer; pick a different printer
+in the panel to edit *its* defaults instead. When you send a file it's seeded with the default
+printer's saved options, and choosing a different printer in the per-file panel loads that printer's
+defaults too (keeping the copies and page range you picked for the document).
 
 ### Dry run
 `/settings` also has a **🧪 Dry run** toggle. When it's on, sending a file (or pressing *Print*)
 logs the exact `lp` command that *would* run, to `printerbot.log`, and reports back that nothing
-was printed — useful for testing the bot without wasting paper. It's a per-user preference, so it
-applies to every file you print until you turn it off.
+was printed — useful for testing the bot without wasting paper. Like the other options it's saved
+per printer, so it applies to every file printed to that printer until you turn it off.
 
 ## Details
  * Password authentication; authorized users are **persisted** across restarts (in `state.json`)
- * Per-user default print settings are persisted in the same `state.json`
+ * Per-printer default print settings are persisted in the same `state.json`
  * Uses `libreoffice` to convert files to PDF format before printing
  * Uses `pdftoppm` (poppler) to render the first-page preview
  * Uses `lp` (CUPS) to send a file to the printer with the chosen options, and `lpstat`/`cancel` for status and cancellation
@@ -57,10 +63,10 @@ collaborator behind an interface so it can be swapped or tested in isolation:
 
 | Module | Responsibility |
 | --- | --- |
-| `domain.py` | Plain data types — `PrintOptions`, `PrintResult`, `JobState`, `UserSettings`, enums |
+| `domain.py` | Plain data types — `PrintOptions`, `PrintResult`, `JobState`, enums |
 | `commands.py` | `CommandRunner` — the single seam for external commands (no shell, captures output) |
 | `storage.py` | `StateStore` — persistent key/value store with atomic `update()` (`JsonFileStore` / `InMemoryStateStore`) |
-| `interfaces.py` | Abstract `PrinterInterface`, `FileProcessorInterface`, `AuthManagerInterface`, `UserSettingsStoreInterface` |
+| `interfaces.py` | Abstract `PrinterInterface`, `FileProcessorInterface`, `AuthManagerInterface`, `PrinterSettingsStoreInterface` |
 | `adapters.py` | `SystemPrinter` (CUPS), `LibreOfficeFileProcessor`, auth + settings stores |
 | `service.py` | `PrinterBotService` — backend-agnostic business logic |
 | `ui.py` | Pure keyboard/option logic (`build_options_keyboard`, `apply_option_action`) — unit-tested without Telegram |

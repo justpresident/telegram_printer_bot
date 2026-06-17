@@ -11,11 +11,11 @@ from printerbot import (
     SystemPrinter, LibreOfficeFileProcessor, InMemoryAuthManager, FileAuthManager,
     PrinterBotService, TelegramPrinterBot, setup_logging,
     # new domain + infra
-    PrintOptions, PrintResult, JobPhase, UserSettings,
+    PrintOptions, PrintResult, JobPhase, printer_key,
     Duplex, ColorMode, PaperSize,
     CommandRunner, CommandResult,
     InMemoryStateStore, JsonFileStore,
-    PersistentAuthManager, StoreBackedUserSettings,
+    PersistentAuthManager, StoreBackedPrinterSettings,
     # UI pure functions
     apply_option_action, apply_field_choice, field_choices,
     build_options_keyboard, build_submenu_keyboard, fenced_block,
@@ -450,14 +450,14 @@ class TestSharedStoreNoClobber:
     def test_auth_and_settings_share_store_without_clobbering(self):
         store = InMemoryStateStore()
         auth = PersistentAuthManager("pw", store)
-        settings = StoreBackedUserSettings(store)
+        settings = StoreBackedPrinterSettings(store)
         # Interleave writes through the SAME store.
         auth.authorize_user(111, "pw")
-        settings.set(111, UserSettings(PrintOptions(copies=3)))
+        settings.set("Office", PrintOptions(copies=3, printer="Office"))
         auth.authorize_user(222, "pw")
         # Both managers' data survives.
         assert auth.is_authorized(111) and auth.is_authorized(222)
-        assert settings.get(111).default_options.copies == 3
+        assert settings.get("Office").copies == 3
 
 
 class TestPersistentAuthManager:
@@ -477,23 +477,30 @@ class TestPersistentAuthManager:
         assert not a.is_authorized(111)
 
 
-class TestStoreBackedUserSettings:
-    def test_default_when_absent(self):
-        s = StoreBackedUserSettings(InMemoryStateStore())
-        assert s.get(42).default_options == PrintOptions()
+class TestStoreBackedPrinterSettings:
+    def test_default_when_absent_matches_key(self):
+        s = StoreBackedPrinterSettings(InMemoryStateStore())
+        # the system-default printer ("") -> printer=None
+        assert s.get("").printer is None
+        # an unknown named printer -> options whose printer matches the key
+        assert s.get("Office").printer == "Office"
 
-    def test_set_then_get(self):
+    def test_set_then_get_persists(self):
         store = InMemoryStateStore()
-        s = StoreBackedUserSettings(store)
-        opts = PrintOptions(copies=3, color=ColorMode.GRAYSCALE)
-        s.set(42, UserSettings(default_options=opts))
+        s = StoreBackedPrinterSettings(store)
+        opts = PrintOptions(copies=3, color=ColorMode.GRAYSCALE, printer="Office")
+        s.set("Office", opts)
         # New instance, same store -> persisted.
-        assert StoreBackedUserSettings(store).get(42).default_options == opts
+        assert StoreBackedPrinterSettings(store).get("Office") == opts
 
-    def test_settings_isolated_per_user(self):
-        s = StoreBackedUserSettings(InMemoryStateStore())
-        s.set(1, UserSettings(PrintOptions(copies=5)))
-        assert s.get(2).default_options.copies == 1
+    def test_settings_isolated_per_printer(self):
+        s = StoreBackedPrinterSettings(InMemoryStateStore())
+        s.set("A", PrintOptions(copies=5, printer="A"))
+        assert s.get("B").copies == 1  # printer B untouched
+
+    def test_printer_key_helper(self):
+        assert printer_key(None) == ""
+        assert printer_key("Office") == "Office"
 
 
 # =============================================================================
@@ -720,10 +727,29 @@ class TestPrinterBotService:
         self.mock_printer.list_printers.side_effect = RuntimeError("boom")
         assert self.service.list_printers() == []
 
-    def test_user_settings_roundtrip(self):
-        opts = PrintOptions(copies=4)
-        self.service.update_user_settings(7, UserSettings(default_options=opts))
-        assert self.service.default_options_for(7) == opts
+    def test_printer_defaults_roundtrip(self):
+        opts = PrintOptions(copies=4, printer="Office")
+        self.service.save_printer_defaults(opts)
+        assert self.service.get_printer_defaults("Office") == opts
+
+    def test_save_printer_defaults_keys_by_printer(self):
+        # system default (printer=None) is stored under "" and isolated
+        self.service.save_printer_defaults(PrintOptions(copies=2))            # printer=None
+        self.service.save_printer_defaults(PrintOptions(copies=9, printer="Office"))
+        assert self.service.get_printer_defaults("").copies == 2
+        assert self.service.get_printer_defaults("Office").copies == 9
+
+    def test_default_printer_key_uses_cups_default(self):
+        from printerbot import PrinterInfo
+        self.mock_printer.list_printers.return_value = [
+            PrinterInfo("A", is_default=False), PrinterInfo("B", is_default=True)]
+        assert self.service.default_printer_key() == "B"
+
+    def test_seed_options_loads_default_printer_defaults(self):
+        from printerbot import PrinterInfo
+        self.mock_printer.list_printers.return_value = [PrinterInfo("Office", is_default=True)]
+        self.service.save_printer_defaults(PrintOptions(copies=7, printer="Office"))
+        assert self.service.seed_options().copies == 7
 
     def test_generate_temp_filename(self):
         filename = self.service.generate_temp_filename("test.pdf")
@@ -857,12 +883,15 @@ class TestTelegramPrinterBot:
         mock_update.message.from_user.id = 12345
         mock_update.message.from_user.username = "u"
         mock_update.callback_query = None
+        mock_context.user_data = {}
         self.mock_service.is_user_authorized.return_value = True
-        self.mock_service.default_options_for.return_value = PrintOptions()
         self.mock_service.list_printers.return_value = []
+        self.mock_service.get_printer_defaults.return_value = PrintOptions()
         await self.bot.settings(mock_update, mock_context)
         kwargs = mock_update.message.reply_text.call_args.kwargs
         assert kwargs.get("reply_markup") is not None
+        # settings panel remembers which printer is being edited
+        assert mock_context.user_data["settings_printer"] == ""
 
     @pytest.mark.asyncio
     async def test_button_option_mutation_updates_registry(self):
@@ -908,6 +937,35 @@ class TestTelegramPrinterBot:
 
         assert context.user_data["jobs"]["tok"]["options"].duplex == Duplex.TWO_SIDED_LONG
         query.edit_message_reply_markup.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_button_select_printer_loads_its_defaults_in_job(self):
+        # Selecting printer index 1 (= "Office") loads Office's saved defaults,
+        # while keeping document-specific copies/page_ranges.
+        query = AsyncMock()
+        query.data = "set:printer:1 j:tok"
+        query.from_user.id = 1
+        query.from_user.username = "u"
+        query.message.photo = None
+        mock_update = Mock()
+        mock_update.message = None
+        mock_update.callback_query = query
+        context = Mock()
+        context.user_data = {"jobs": {"tok": {
+            "file_path": "/x.pdf", "page_count": 1,
+            "options": PrintOptions(copies=3, page_ranges="2-4"), "printers": ["Office", "Photo"],
+        }}}
+        self.mock_service.is_user_authorized.return_value = True
+        self.mock_service.get_printer_defaults.return_value = PrintOptions(
+            printer="Office", color=ColorMode.GRAYSCALE, duplex=Duplex.TWO_SIDED_LONG)
+
+        await self.bot.button(mock_update, context)
+
+        opts = context.user_data["jobs"]["tok"]["options"]
+        self.mock_service.get_printer_defaults.assert_called_with("Office")
+        assert opts.printer == "Office"
+        assert opts.color == ColorMode.GRAYSCALE      # loaded from Office defaults
+        assert opts.copies == 3 and opts.page_ranges == "2-4"  # document choices kept
 
     @pytest.mark.asyncio
     async def test_button_print_sends_to_printer(self):
@@ -1082,7 +1140,7 @@ class TestIntegration:
             file_processor=file_processor,
             auth_manager=auth_manager,
             files_dir=self.temp_dir,
-            settings_store=StoreBackedUserSettings(store),
+            printer_settings=StoreBackedPrinterSettings(store),
         )
 
         assert service.authenticate_user(12345, "integration_test_password")[0] is True
@@ -1092,9 +1150,9 @@ class TestIntegration:
         assert status.status == "printer ready"
         assert status.queue == "no entries"
 
-        # Settings persist through the same shared store.
-        service.update_user_settings(12345, UserSettings(PrintOptions(copies=2)))
-        assert service.default_options_for(12345).copies == 2
+        # Per-printer settings persist through the same shared store.
+        service.save_printer_defaults(PrintOptions(copies=2, printer="Office"))
+        assert service.get_printer_defaults("Office").copies == 2
 
 
 if __name__ == '__main__':

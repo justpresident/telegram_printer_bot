@@ -1,6 +1,6 @@
 """Domain types: file/print descriptions, options, results, job state."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 from enum import Enum
 
@@ -152,18 +152,9 @@ class JobState:
         return self.phase == JobPhase.COMPLETED
 
 
-@dataclass
-class UserSettings:
-    """Per-user persisted preferences. Currently just default print options,
-    kept as a wrapper so more preferences can be added without changing the
-    storage interface."""
-    default_options: PrintOptions = field(default_factory=PrintOptions)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {"default_options": self.default_options.to_dict()}
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "UserSettings":
-        return cls(default_options=PrintOptions.from_dict(data.get("default_options", {})))
+def printer_key(printer: Optional[str]) -> str:
+    """The storage key for a printer's saved settings. The system-default
+    printer (printer=None) is keyed by the empty string."""
+    return printer or ""
 
 

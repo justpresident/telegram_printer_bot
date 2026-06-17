@@ -8,16 +8,16 @@ import pathlib
 from typing import Optional, Tuple, List
 
 from .domain import (
-    FileType, FileInfo,
+    FileType, FileInfo, printer_key,
     PrintOptions, PrintResult, PrinterStatus, JobStatus, PrinterInfo, JobState,
-    UserSettings, Duplex, ColorMode,
+    Duplex, ColorMode,
 )
 from .interfaces import (
     PrinterInterface, FileProcessorInterface, AuthManagerInterface,
-    UserSettingsStoreInterface,
+    PrinterSettingsStoreInterface,
 )
 from .storage import InMemoryStateStore
-from .adapters import StoreBackedUserSettings
+from .adapters import StoreBackedPrinterSettings
 
 
 class PrinterBotService:
@@ -29,7 +29,7 @@ class PrinterBotService:
         file_processor: FileProcessorInterface,
         auth_manager: AuthManagerInterface,
         files_dir: str,
-        settings_store: Optional[UserSettingsStoreInterface] = None,
+        printer_settings: Optional[PrinterSettingsStoreInterface] = None,
         file_size_limit: int = 64 * 1024 * 1024,
         max_pages_limit: int = 100
     ):
@@ -37,7 +37,7 @@ class PrinterBotService:
         self.file_processor = file_processor
         self.auth_manager = auth_manager
         self.files_dir = files_dir
-        self.settings_store = settings_store or StoreBackedUserSettings(InMemoryStateStore())
+        self.printer_settings = printer_settings or StoreBackedPrinterSettings(InMemoryStateStore())
         self.file_size_limit = file_size_limit
         self.max_pages_limit = max_pages_limit
 
@@ -88,16 +88,28 @@ class PrinterBotService:
     def is_user_authorized(self, user_id: int) -> bool:
         return self.auth_manager.is_authorized(user_id)
 
-    # -- per-user settings --------------------------------------------------
+    # -- per-printer settings -----------------------------------------------
 
-    def get_user_settings(self, user_id: int) -> UserSettings:
-        return self.settings_store.get(user_id)
+    def get_printer_defaults(self, key: str) -> PrintOptions:
+        """Saved default options for a printer (key = printer name, or "" for
+        the system-default printer)."""
+        return self.printer_settings.get(key)
 
-    def update_user_settings(self, user_id: int, settings: UserSettings) -> None:
-        self.settings_store.set(user_id, settings)
+    def save_printer_defaults(self, options: PrintOptions) -> None:
+        """Persist `options` as the defaults for the printer it targets."""
+        self.printer_settings.set(printer_key(options.printer), options)
 
-    def default_options_for(self, user_id: int) -> PrintOptions:
-        return self.get_user_settings(user_id).default_options
+    def default_printer_key(self) -> str:
+        """Key of the system's default printer (CUPS default), or "" if none."""
+        for info in self.list_printers():
+            if info.is_default:
+                return info.name
+        return ""
+
+    def seed_options(self) -> PrintOptions:
+        """Default options for a brand-new job: the default printer's saved
+        defaults."""
+        return self.get_printer_defaults(self.default_printer_key())
 
     # -- files --------------------------------------------------------------
 

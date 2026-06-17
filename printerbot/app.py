@@ -5,7 +5,7 @@ import logging
 from .service import PrinterBotService
 from .adapters import (
     SystemPrinter, LibreOfficeFileProcessor, PersistentAuthManager,
-    StoreBackedUserSettings,
+    StoreBackedPrinterSettings,
 )
 from .storage import JsonFileStore
 from .bot import TelegramPrinterBot
@@ -53,7 +53,7 @@ def main() -> None:
         printer = SystemPrinter(logger=logger)
         file_processor = LibreOfficeFileProcessor()
         auth_manager = PersistentAuthManager(password, state_store)
-        settings_store = StoreBackedUserSettings(state_store)
+        printer_settings = StoreBackedPrinterSettings(state_store)
 
         # Create service
         service = PrinterBotService(
@@ -61,7 +61,7 @@ def main() -> None:
             file_processor=file_processor,
             auth_manager=auth_manager,
             files_dir=files_dir,
-            settings_store=settings_store,
+            printer_settings=printer_settings,
             file_size_limit=64 * 1024 * 1024,
             max_pages_limit=100
         )

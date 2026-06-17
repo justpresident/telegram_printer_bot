@@ -8,13 +8,13 @@ from typing import Optional, Tuple, Set, List
 
 from .domain import (
     PrinterStatus, JobStatus, PrintOptions, PrintResult, PrinterInfo,
-    JobState, JobPhase, ColorMode, UserSettings,
+    JobState, JobPhase, ColorMode,
 )
 from .commands import CommandRunner, SubprocessCommandRunner
 from .storage import StateStore
 from .interfaces import (
     PrinterInterface, FileProcessorInterface, AuthManagerInterface,
-    UserSettingsStoreInterface,
+    PrinterSettingsStoreInterface,
 )
 
 
@@ -256,23 +256,27 @@ class PersistentAuthManager(AuthManagerInterface):
         return self.correct_password
 
 
-class StoreBackedUserSettings(UserSettingsStoreInterface):
-    """Per-user settings persisted in a StateStore (keyed by user id)."""
+class StoreBackedPrinterSettings(PrinterSettingsStoreInterface):
+    """Per-printer default options persisted in a StateStore (keyed by printer
+    name; the system-default printer uses the empty string)."""
 
-    STORE_KEY = "user_settings"
+    STORE_KEY = "printer_settings"
 
     def __init__(self, store: StateStore):
         self.store = store
 
-    def get(self, user_id: int) -> UserSettings:
+    def get(self, printer_key: str) -> PrintOptions:
         bucket = self.store.load().get(self.STORE_KEY, {})
-        raw = bucket.get(str(user_id))
-        return UserSettings.from_dict(raw) if raw else UserSettings()
+        raw = bucket.get(printer_key)
+        if raw:
+            return PrintOptions.from_dict(raw)
+        # Unknown printer: fresh defaults whose printer matches the key.
+        return PrintOptions(printer=printer_key or None)
 
-    def set(self, user_id: int, settings: UserSettings) -> None:
+    def set(self, printer_key: str, options: PrintOptions) -> None:
         def mutate(data):
             bucket = data.setdefault(self.STORE_KEY, {})
-            bucket[str(user_id)] = settings.to_dict()
+            bucket[printer_key] = options.to_dict()
 
         self.store.update(mutate)
 

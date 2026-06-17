@@ -5,7 +5,6 @@ from typing import Optional, Tuple, List
 
 from .domain import (
     PrinterStatus, JobStatus, PrintOptions, PrintResult, PrinterInfo, JobState,
-    UserSettings,
 )
 
 
@@ -77,15 +76,16 @@ class AuthManagerInterface(ABC):
         pass
 
 
-class UserSettingsStoreInterface(ABC):
-    """Abstract interface for per-user settings persistence"""
+class PrinterSettingsStoreInterface(ABC):
+    """Abstract interface for per-printer default-settings persistence.
+    Keyed by printer name; the system-default printer uses the empty string."""
 
     @abstractmethod
-    def get(self, user_id: int) -> UserSettings:
+    def get(self, printer_key: str) -> PrintOptions:
         pass
 
     @abstractmethod
-    def set(self, user_id: int, settings: UserSettings) -> None:
+    def set(self, printer_key: str, options: PrintOptions) -> None:
         pass
 
 

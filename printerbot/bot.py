@@ -24,6 +24,19 @@ from .ui import (
 )
 
 
+def _printer_display(key: str) -> str:
+    """Human label for a printer settings key ("" is the system default)."""
+    return key if key else "System default"
+
+
+def _printer_key_for_index(index: int, printer_names: List[str]) -> str:
+    """Map a printer sub-menu index to its settings key. Index 0 is always the
+    system default ("")."""
+    if 1 <= index <= len(printer_names):
+        return printer_names[index - 1]
+    return ""
+
+
 class TelegramPrinterBot:
     """Telegram bot wrapper around PrinterBotService"""
 
@@ -221,10 +234,17 @@ class TelegramPrinterBot:
         if not self.service.is_user_authorized(user_id):
             return await self._request_auth(update, context)
 
-        options = self.service.default_options_for(user_id)
-        keyboard = build_options_keyboard(options, SCOPE_SETTINGS, "_", await self._printer_names())
+        printers = await self._offload(self.service.list_printers)
+        printer_names = [p.name for p in printers]
+        key = next((p.name for p in printers if p.is_default), "")
+        context.user_data["settings_printer"] = key
+        options = self.service.get_printer_defaults(key)
+        keyboard = build_options_keyboard(options, SCOPE_SETTINGS, "_", printer_names)
         await update.message.reply_text(
-            "⚙️ Your default print settings (applied to every new file):",
+            f"⚙️ Default print settings for *{_printer_display(key)}*.\n"
+            "These apply to new files sent to this printer; pick a different "
+            "printer below to edit its defaults.",
+            parse_mode="Markdown",
             reply_markup=keyboard,
         )
 
@@ -323,8 +343,10 @@ class TelegramPrinterBot:
 
     async def _present_print_panel(self, update, context, user_id, processed_path, page_count):
         """Register the job and show the interactive options panel (with preview)."""
-        options = self.service.default_options_for(user_id)
-        printer_names = await self._printer_names()
+        printers = await self._offload(self.service.list_printers)
+        printer_names = [p.name for p in printers]
+        default_key = next((p.name for p in printers if p.is_default), "")
+        options = self.service.get_printer_defaults(default_key)
 
         token = secrets.token_hex(4)
         self._job_registry(context)[token] = {
@@ -393,7 +415,9 @@ class TelegramPrinterBot:
         sub-menu open/back/set, the copies & dry-run controls, range entry, and
         the job-only Print/Delete and settings-only Done actions."""
         # Resolve where the current options live and how to persist a change.
-        entry = settings = None
+        # Job options live in the registry (one-off); settings options are the
+        # saved defaults of the printer currently shown in the panel.
+        entry = None
         if scope == SCOPE_JOB:
             entry = self._job_registry(context).get(key)
             if not entry:
@@ -402,15 +426,15 @@ class TelegramPrinterBot:
             options = entry["options"]
             printer_names = entry.get("printers") or []
         else:
-            settings = self.service.get_user_settings(user_id)
-            options = settings.default_options
+            settings_key = context.user_data.get("settings_printer", "")
+            options = self.service.get_printer_defaults(settings_key)
             printer_names = await self._printer_names()
 
         def persist(new_options):
             if entry is not None:
                 entry["options"] = new_options
             else:
-                self.service.update_user_settings(user_id, replace(settings, default_options=new_options))
+                self.service.save_printer_defaults(new_options)
 
         # Terminal actions.
         if scope == SCOPE_JOB and verb == "print":
@@ -446,8 +470,12 @@ class TelegramPrinterBot:
             parts = verb.split(":", 2)  # set:<field>:<index>
             if len(parts) != 3 or not parts[2].lstrip("-").isdigit():
                 return
-            new_options = apply_field_choice(options, parts[1], int(parts[2]), printer_names)
-            persist(new_options)
+            field, index = parts[1], int(parts[2])
+            if field == "printer":
+                new_options = self._select_printer(context, entry, scope, options, index, printer_names)
+            else:
+                new_options = apply_field_choice(options, field, index, printer_names)
+                persist(new_options)
             await self._render_panel(query, build_options_keyboard(new_options, scope, key, printer_names))
             return
 
@@ -455,6 +483,20 @@ class TelegramPrinterBot:
         new_options = apply_option_action(options, verb)
         persist(new_options)
         await self._render_panel(query, build_options_keyboard(new_options, scope, key, printer_names))
+
+    def _select_printer(self, context, entry, scope, options, index, printer_names):
+        """Pick a printer from its sub-menu. Selecting a printer loads that
+        printer's saved defaults (the point of per-printer settings)."""
+        chosen_key = _printer_key_for_index(index, printer_names)
+        defaults = self.service.get_printer_defaults(chosen_key)
+        if scope == SCOPE_JOB:
+            # Keep the document-specific choices when switching printer.
+            new_options = replace(defaults, copies=options.copies, page_ranges=options.page_ranges)
+            entry["options"] = new_options
+            return new_options
+        # Settings: switch which printer we're editing (no save until changed).
+        context.user_data["settings_printer"] = chosen_key
+        return defaults
 
     async def _render_panel(self, query, keyboard):
         try:
@@ -494,7 +536,6 @@ class TelegramPrinterBot:
 
         pending = context.user_data.pop("awaiting_range")
         scope, key = pending["scope"], pending["key"]
-        user_id = self._get_user_id(update)
 
         if scope == SCOPE_JOB:
             entry = self._job_registry(context).get(key)
@@ -504,9 +545,9 @@ class TelegramPrinterBot:
             entry["options"] = replace(entry["options"], page_ranges=page_ranges)
             options, printer_names = entry["options"], entry.get("printers")
         else:
-            settings = self.service.get_user_settings(user_id)
-            options = replace(settings.default_options, page_ranges=page_ranges)
-            self.service.update_user_settings(user_id, replace(settings, default_options=options))
+            settings_key = context.user_data.get("settings_printer", "")
+            options = replace(self.service.get_printer_defaults(settings_key), page_ranges=page_ranges)
+            self.service.save_printer_defaults(options)
             printer_names = await self._printer_names()
 
         # Re-render the original panel's keyboard in place.
