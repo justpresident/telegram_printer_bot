@@ -14,3 +14,4 @@ state.json.tmp
 coverage.xml
 htmlcov
 state.json.lock
+.claude
