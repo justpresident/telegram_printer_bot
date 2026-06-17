@@ -6,6 +6,7 @@ import json
 import pathlib
 import re
 import secrets
+import shlex
 import subprocess
 import tempfile
 import asyncio
@@ -104,6 +105,7 @@ class PrintOptions:
     number_up: int = 1
     page_ranges: str = ""          # "" means all pages, else e.g. "2-5" / "1,3,5"
     printer: Optional[str] = None  # None means the system default printer
+    dry_run: bool = False          # log the print command instead of executing it
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -114,6 +116,7 @@ class PrintOptions:
             "number_up": self.number_up,
             "page_ranges": self.page_ranges,
             "printer": self.printer,
+            "dry_run": self.dry_run,
         }
 
     @classmethod
@@ -144,6 +147,7 @@ class PrintOptions:
             number_up=number_up,
             page_ranges=str(data.get("page_ranges") or ""),
             printer=data.get("printer") or None,
+            dry_run=bool(data.get("dry_run", False)),
         )
 
 
@@ -381,8 +385,10 @@ class UserSettingsStoreInterface(ABC):
 class SystemPrinter(PrinterInterface):
     """System printer implementation using CUPS commands (lp/lpstat/lpq)."""
 
-    def __init__(self, runner: Optional[CommandRunner] = None):
+    def __init__(self, runner: Optional[CommandRunner] = None,
+                 logger: Optional[logging.Logger] = None):
         self.runner = runner or SubprocessCommandRunner()
+        self.logger = logger or logging.getLogger("printerbot.printer")
 
     def get_status(self) -> PrinterStatus:
         status = self.runner.run(["lpstat", "-p"])
@@ -409,6 +415,10 @@ class SystemPrinter(PrinterInterface):
 
     def print_file(self, file_path: str, options: PrintOptions) -> PrintResult:
         args = ["lp"] + self._options_to_args(options) + [file_path]
+        if options.dry_run:
+            command = " ".join(shlex.quote(a) for a in args)
+            self.logger.info("[DRY RUN] would run: %s", command)
+            return PrintResult(True, None, "Dry run — command logged, nothing printed")
         result = self.runner.run(args)
         if result.ok:
             return PrintResult(True, self._parse_job_id(result.stdout), "Sent to printer")
@@ -768,6 +778,8 @@ class PrinterBotService:
 
             if result.success:
                 summary = self._describe_job(page_count, options)
+                if options.dry_run:
+                    return PrintResult(True, result.job_id, f"🧪 Dry run — command logged, nothing printed {summary}")
                 return PrintResult(True, result.job_id, f"Sent to printer! {summary}")
             return PrintResult(False, None, result.message or "Failed to send file to printer")
 
@@ -876,6 +888,8 @@ def apply_option_action(options: PrintOptions, verb: str,
             return options
         current = options.printer if options.printer in names else names[0]
         return replace(options, printer=_next_in_cycle(current, names))
+    if verb == "dryrun":
+        return replace(options, dry_run=not options.dry_run)
     return options
 
 
@@ -924,6 +938,10 @@ def build_options_keyboard(options: PrintOptions, scope: str, key: str,
             InlineKeyboardButton("🗑️ Delete", callback_data=f"delete {target}"),
         ])
     else:
+        # Dry run is a mode/preference, so it only appears in the settings panel;
+        # per-file jobs still inherit and honor whatever default is set here.
+        dry_state = "ON" if options.dry_run else "OFF"
+        rows.append([InlineKeyboardButton(f"🧪 Dry run: {dry_state}", callback_data=f"dryrun {target}")])
         rows.append([InlineKeyboardButton("✅ Done", callback_data=f"done {target}")])
 
     return InlineKeyboardMarkup(rows)
@@ -1510,7 +1528,7 @@ def main() -> None:
         state_store = JsonFileStore(state_path)
 
         # Create service components
-        printer = SystemPrinter()
+        printer = SystemPrinter(logger=logger)
         file_processor = LibreOfficeFileProcessor()
         auth_manager = PersistentAuthManager(password, state_store)
         settings_store = StoreBackedUserSettings(state_store)

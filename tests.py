@@ -106,6 +106,23 @@ class TestSystemPrinter:
         assert result.job_id is None
         assert "printer offline" in result.message
 
+    def test_dry_run_logs_and_does_not_execute(self):
+        runner = FakeCommandRunner(default=CommandResult(0, "request id is P-1 (1 file(s))", ""))
+        logger = Mock()
+        printer = SystemPrinter(runner=runner, logger=logger)
+        result = printer.print_file("/x/file.pdf", PrintOptions(copies=2, dry_run=True))
+        # nothing was actually executed
+        assert runner.calls == []
+        # but a command was logged
+        assert logger.info.called
+        logged = " ".join(str(a) for a in logger.info.call_args[0])
+        assert "DRY RUN" in logged
+        assert "lp" in logged
+        # reports success with no job id (so no live polling)
+        assert result.success is True
+        assert result.job_id is None
+        assert "nothing printed" in result.message.lower()
+
     def test_options_translate_to_lp_args(self):
         runner = FakeCommandRunner(default=CommandResult(0, "request id is P-1 (1 file(s))", ""))
         options = PrintOptions(
@@ -242,6 +259,11 @@ class TestPrintOptions:
         assert PrintOptions.from_dict({"copies": 9999}).copies == 99
         assert PrintOptions.from_dict({"copies": 0}).copies == 1
 
+    def test_dry_run_defaults_false_and_roundtrips(self):
+        assert PrintOptions().dry_run is False
+        o = PrintOptions(dry_run=True)
+        assert PrintOptions.from_dict(o.to_dict()).dry_run is True
+
 
 # =============================================================================
 # UI pure functions
@@ -279,6 +301,11 @@ class TestApplyOptionAction:
     def test_printer_noop_without_printers(self):
         assert apply_option_action(PrintOptions(), "printer", []).printer is None
 
+    def test_dryrun_toggles(self):
+        on = apply_option_action(PrintOptions(), "dryrun")
+        assert on.dry_run is True
+        assert apply_option_action(on, "dryrun").dry_run is False
+
     def test_unknown_verb_is_noop(self):
         o = PrintOptions(copies=2)
         assert apply_option_action(o, "whatever") == o
@@ -300,6 +327,20 @@ class TestBuildOptionsKeyboard:
         cbs = self._callbacks(markup)
         assert "done s:_" in cbs
         assert "print s:_" not in cbs
+
+    def test_dry_run_toggle_only_in_settings_scope(self):
+        job = build_options_keyboard(PrintOptions(), SCOPE_JOB, "tok", [])
+        settings = build_options_keyboard(PrintOptions(), SCOPE_SETTINGS, "_", [])
+        assert not any(c.startswith("dryrun") for c in self._callbacks(job))
+        assert "dryrun s:_" in self._callbacks(settings)
+
+    def test_dry_run_label_reflects_state(self):
+        off = build_options_keyboard(PrintOptions(dry_run=False), SCOPE_SETTINGS, "_", [])
+        on = build_options_keyboard(PrintOptions(dry_run=True), SCOPE_SETTINGS, "_", [])
+        labels_off = [b.text for row in off.inline_keyboard for b in row]
+        labels_on = [b.text for row in on.inline_keyboard for b in row]
+        assert any("Dry run: OFF" in t for t in labels_off)
+        assert any("Dry run: ON" in t for t in labels_on)
 
     def test_printer_button_only_when_multiple(self):
         one = build_options_keyboard(PrintOptions(), SCOPE_JOB, "t", ["A"])
@@ -529,6 +570,17 @@ class TestPrinterBotService:
         result = self.service.print_file("/nonexistent/file.pdf")
         assert result.success is False
         assert "File not found" in result.message
+
+    def test_print_file_dry_run_message(self):
+        test_file = self._make_file()
+        self.mock_file_processor.get_page_count.return_value = 2
+        # adapter signals a dry run succeeded without a job id
+        self.mock_printer.print_file.return_value = PrintResult(True, None, "Dry run — command logged, nothing printed")
+        result = self.service.print_file(test_file, PrintOptions(dry_run=True))
+        assert result.success is True
+        assert result.job_id is None
+        assert "dry run" in result.message.lower()
+        assert "nothing printed" in result.message.lower()
 
     def test_print_file_printer_failure(self):
         test_file = self._make_file()

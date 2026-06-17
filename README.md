@@ -30,6 +30,12 @@ Both the per-file panel and `/settings` expose the same controls (translated to 
 
 Per-file choices start from your saved `/settings` defaults and can be tweaked just for that file.
 
+### Dry run
+`/settings` also has a **🧪 Dry run** toggle. When it's on, sending a file (or pressing *Print*)
+logs the exact `lp` command that *would* run, to `printerbot.log`, and reports back that nothing
+was printed — useful for testing the bot without wasting paper. It's a per-user preference, so it
+applies to every file you print until you turn it off.
+
 ## Details
  * Password authentication; authorized users are **persisted** across restarts (in `state.json`)
  * Per-user default print settings are persisted in the same `state.json`
