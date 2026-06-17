@@ -8,7 +8,7 @@ import re
 import secrets
 import shlex
 import subprocess
-import tempfile
+import time
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
@@ -743,15 +743,21 @@ class PrinterBotService:
             )
 
             if not conversion_success:
+                # The original download is now useless — don't leak it.
+                self._remove_quietly(file_path)
                 return False, "Failed to convert file!", 0, ""
+
+            # Conversion produced a new PDF; the original source is no longer needed.
+            if processed_path != file_path:
+                self._remove_quietly(file_path)
 
             # Get page count
             page_count = self.file_processor.get_page_count(processed_path)
 
             # Check page limit
             if page_count > self.max_pages_limit:
-                # Clean up file
-                self._cleanup_file(processed_path, file_path)
+                # Clean up the (already converted) file
+                self._remove_quietly(processed_path)
                 return False, f"Too many pages ({page_count} > {self.max_pages_limit} limit)!", 0, ""
 
             return True, "File processed successfully", page_count, processed_path
@@ -797,9 +803,10 @@ class PrinterBotService:
             return False, f"Error deleting file: {str(e)}"
 
     def generate_temp_filename(self, original_name: str) -> str:
-        temp_name = next(tempfile._get_candidate_names())
+        # A random, collision-resistant base name (avoids the private
+        # tempfile._get_candidate_names API and name clashes in files_dir).
         _, file_extension = os.path.splitext(original_name)
-        return temp_name + (file_extension if file_extension else "")
+        return secrets.token_hex(16) + (file_extension if file_extension else "")
 
     # -- internals ----------------------------------------------------------
 
@@ -823,20 +830,41 @@ class PrinterBotService:
             abs_file_path = os.path.abspath(file_path)
             abs_files_dir = os.path.abspath(self.files_dir)
 
-            return (abs_file_path.startswith(abs_files_dir) and
-                    os.path.exists(abs_file_path) and
-                    os.path.isfile(abs_file_path))
+            # Containment check via commonpath so that a sibling directory
+            # like "<files_dir>_evil" is not mistaken for being inside files_dir.
+            if os.path.commonpath([abs_file_path, abs_files_dir]) != abs_files_dir:
+                return False
+            return os.path.exists(abs_file_path) and os.path.isfile(abs_file_path)
         except Exception:
             return False
 
-    def _cleanup_file(self, processed_path: str, original_path: str):
+    def _remove_quietly(self, path: str):
         try:
-            if os.path.exists(processed_path):
-                os.unlink(processed_path)
-            if processed_path != original_path and os.path.exists(original_path):
-                os.unlink(original_path)
+            if path and os.path.exists(path):
+                os.unlink(path)
         except Exception:
             pass
+
+    def cleanup_stale_files(self, max_age_seconds: int = 24 * 3600) -> int:
+        """Delete files in files_dir older than max_age_seconds. Bounds disk
+        usage from jobs that were uploaded but never printed/deleted (e.g. the
+        user abandoned the panel, or the in-memory job registry was lost on a
+        restart). Returns the number of files removed."""
+        removed = 0
+        now = time.time()
+        try:
+            entries = os.scandir(self.files_dir)
+        except OSError:
+            return 0
+        with entries:
+            for entry in entries:
+                try:
+                    if entry.is_file() and (now - entry.stat().st_mtime) > max_age_seconds:
+                        os.unlink(entry.path)
+                        removed += 1
+                except OSError:
+                    continue
+        return removed
 
 
 # =============================================================================
@@ -856,6 +884,13 @@ BOT_COMMANDS: List[Tuple[str, str]] = [
     ("completed", "Show recently completed jobs"),
     ("cancel", "Cancel a job: /cancel <job_id>"),
 ]
+
+
+def fenced_block(text: str) -> str:
+    """Wrap (untrusted) command output in a Markdown code fence, neutralizing
+    backticks so the output can't break out of the fence and trip Telegram's
+    Markdown parser."""
+    return "```\n" + text.replace("`", "ʼ") + "\n```"
 
 
 def _next_in_cycle(value, cycle):
@@ -1063,8 +1098,8 @@ class TelegramPrinterBot:
             await update.message.reply_text("🖨️ You are authorized to print! Just send a file here.")
         else:
             msg = "🖨️ You are authorized to print! Just send a file here.\n\n"
-            msg += f"📊 Current printer status:\n```\n{status.status}\n```\n\n"
-            msg += f"📋 Printer queue:\n```\n{status.queue}\n```"
+            msg += f"📊 Current printer status:\n{fenced_block(status.status)}\n\n"
+            msg += f"📋 Printer queue:\n{fenced_block(status.queue)}"
             await update.message.reply_text(msg, parse_mode='Markdown')
 
     async def pending(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1079,7 +1114,7 @@ class TelegramPrinterBot:
         if jobs.error:
             await update.message.reply_text("❌ Error checking pending jobs")
         else:
-            msg = "✅ No pending jobs found" if not jobs.jobs else f"⏳ Pending jobs:\n```\n{jobs.jobs}\n```"
+            msg = "✅ No pending jobs found" if not jobs.jobs else f"⏳ Pending jobs:\n{fenced_block(jobs.jobs)}"
             await update.message.reply_text(msg, parse_mode='Markdown')
 
     async def completed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1094,7 +1129,7 @@ class TelegramPrinterBot:
         if jobs.error:
             await update.message.reply_text("❌ Error checking completed jobs")
         else:
-            msg = "📋 No completed jobs found" if not jobs.jobs else f"✅ Recent completed jobs:\n```\n{jobs.jobs}\n```"
+            msg = "📋 No completed jobs found" if not jobs.jobs else f"✅ Recent completed jobs:\n{fenced_block(jobs.jobs)}"
             await update.message.reply_text(msg, parse_mode='Markdown')
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1109,7 +1144,8 @@ class TelegramPrinterBot:
             await update.message.reply_text("❌ Please provide a job ID: `/cancel <job_id>`", parse_mode='Markdown')
             return
 
-        job_id = ''.join(context.args).strip()
+        # A job id is a single token (e.g. "Office-42"); use the first arg only.
+        job_id = context.args[0].strip()
         success, message = self.service.cancel_job(job_id)
 
         if success:
@@ -1352,6 +1388,9 @@ class TelegramPrinterBot:
     # -- page-range typed input ---------------------------------------------
 
     async def _prompt_for_range(self, query, context, scope, key):
+        if not query.message:
+            # Message too old / inaccessible — nothing to anchor the panel edit to.
+            return
         context.user_data["awaiting_range"] = {
             "scope": scope,
             "key": key,
@@ -1365,7 +1404,6 @@ class TelegramPrinterBot:
         )
 
     async def _handle_range_input(self, update: Update, context: CallbackContext):
-        pending = context.user_data.pop("awaiting_range")
         raw = (update.message.text or "").strip()
 
         if raw.lower() in ("all", "*", ""):
@@ -1373,9 +1411,11 @@ class TelegramPrinterBot:
         elif re.match(r'^[0-9]+(?:-[0-9]+)?(?:\s*,\s*[0-9]+(?:-[0-9]+)?)*$', raw):
             page_ranges = re.sub(r'\s+', '', raw)
         else:
+            # Keep awaiting_range set so the user's next message retries the range.
             await update.message.reply_text("❌ Invalid range. Use e.g. `2-5` or `1,3,5` or `all`.", parse_mode="Markdown")
             return
 
+        pending = context.user_data.pop("awaiting_range")
         scope, key = pending["scope"], pending["key"]
         user_id = self._get_user_id(update)
 
@@ -1409,10 +1449,6 @@ class TelegramPrinterBot:
     # -- live job status ----------------------------------------------------
 
     async def _start_live_status(self, query, context, result: PrintResult, page_count):
-        is_photo = bool(query.message and query.message.photo)
-        chat_id = query.message.chat.id
-        message_id = query.message.message_id
-
         if not result.job_id:
             await self._edit_panel(query, f"🖨️ {result.message}")
             return
@@ -1422,9 +1458,15 @@ class TelegramPrinterBot:
         )
         await self._edit_panel(query, f"🖨️ {result.message}\nJob `{result.job_id}` queued…", cancel_kb)
 
-        # Poll the job state in the background and reflect transitions.
+        # Background polling needs a concrete message to edit; skip it if the
+        # callback message is inaccessible (e.g. too old).
+        if not query.message:
+            return
         context.application.create_task(
-            self._poll_job_status(context, chat_id, message_id, result.job_id, page_count, is_photo)
+            self._poll_job_status(
+                context, query.message.chat.id, query.message.message_id,
+                result.job_id, page_count, bool(query.message.photo),
+            )
         )
 
     async def _poll_job_status(self, context, chat_id, message_id, job_id, page_count, is_photo):
@@ -1470,7 +1512,7 @@ class TelegramPrinterBot:
         if message.document:
             return FileInfo(
                 file_id=message.document.file_id,
-                file_size=message.document.file_size,
+                file_size=message.document.file_size or 0,  # Telegram may omit size
                 file_name=message.document.file_name or "document",
                 file_type=FileType.DOCUMENT
             )
@@ -1478,7 +1520,7 @@ class TelegramPrinterBot:
             photo = message.photo[-1]  # Get highest resolution
             return FileInfo(
                 file_id=photo.file_id,
-                file_size=photo.file_size,
+                file_size=photo.file_size or 0,  # Telegram may omit size
                 file_name=f"photo_{photo.file_unique_id}.jpg",
                 file_type=FileType.PHOTO
             )
@@ -1543,6 +1585,11 @@ def main() -> None:
             file_size_limit=64 * 1024 * 1024,
             max_pages_limit=100
         )
+
+        # Drop any leftover files from abandoned/interrupted jobs.
+        swept = service.cleanup_stale_files()
+        if swept:
+            logger.info(f"Cleaned up {swept} stale file(s) from {files_dir}")
 
         # Create and run bot
         bot = TelegramPrinterBot(token, service, logger)

@@ -5,20 +5,19 @@ import os
 import tempfile
 import shutil
 from unittest.mock import Mock, AsyncMock, patch
-from dataclasses import replace
 
 from printerbot import (
-    FileType, FileInfo, PrinterStatus, JobStatus,
+    FileType, FileInfo, PrinterStatus,
     SystemPrinter, LibreOfficeFileProcessor, InMemoryAuthManager, FileAuthManager,
     PrinterBotService, TelegramPrinterBot, setup_logging,
     # new domain + infra
-    PrintOptions, PrintResult, PrinterInfo, JobState, JobPhase, UserSettings,
+    PrintOptions, PrintResult, JobPhase, UserSettings,
     Duplex, ColorMode, PaperSize,
     CommandRunner, CommandResult,
     InMemoryStateStore, JsonFileStore,
     PersistentAuthManager, StoreBackedUserSettings,
     # UI pure functions
-    apply_option_action, build_options_keyboard, SCOPE_JOB, SCOPE_SETTINGS,
+    apply_option_action, build_options_keyboard, fenced_block, SCOPE_JOB, SCOPE_SETTINGS,
 )
 
 
@@ -354,6 +353,17 @@ class TestBuildOptionsKeyboard:
             assert len(c.encode()) <= 64
 
 
+class TestFencedBlock:
+    def test_wraps_in_code_fence(self):
+        assert fenced_block("hello").startswith("```\n")
+        assert fenced_block("hello").endswith("\n```")
+
+    def test_neutralizes_backticks(self):
+        out = fenced_block("evil ``` break")
+        # no backticks survive from the content, so the fence can't be broken
+        assert "`" not in out[3:-3].strip("\n")
+
+
 # =============================================================================
 # Persistence: state stores, persistent auth, settings
 # =============================================================================
@@ -546,12 +556,33 @@ class TestPrinterBotService:
         assert success is False
         assert "Too many pages" in message
 
-    def test_process_file_conversion_failed(self):
+    def test_process_file_conversion_failed_removes_original(self):
         test_file = self._make_file("test.docx")
         self.mock_file_processor.convert_to_pdf.return_value = (test_file, False)
         success, message, _, _ = self.service.process_file(test_file)
         assert success is False
         assert "Failed to convert file" in message
+        # the useless original download is cleaned up
+        assert not os.path.exists(test_file)
+
+    def test_process_file_removes_original_after_conversion(self):
+        src = self._make_file("test.docx")
+        pdf = self._make_file("test.pdf")  # the "converted" output, a different file
+        self.mock_file_processor.convert_to_pdf.return_value = (pdf, True)
+        self.mock_file_processor.get_page_count.return_value = 3
+        success, _, _, processed = self.service.process_file(src)
+        assert success is True
+        assert processed == pdf
+        assert os.path.exists(pdf)        # kept for printing
+        assert not os.path.exists(src)    # original source removed
+
+    def test_process_file_pdf_keeps_single_file(self):
+        pdf = self._make_file("test.pdf")
+        self.mock_file_processor.convert_to_pdf.return_value = (pdf, True)  # is_pdf -> same path
+        self.mock_file_processor.get_page_count.return_value = 2
+        success, _, _, processed = self.service.process_file(pdf)
+        assert success is True
+        assert os.path.exists(pdf)
 
     def test_print_file_success_returns_result(self):
         test_file = self._make_file()
@@ -628,6 +659,33 @@ class TestPrinterBotService:
         filename = self.service.generate_temp_filename("test.pdf")
         assert filename.endswith(".pdf")
         assert len(filename) > 4
+
+    def test_generate_temp_filename_unique(self):
+        names = {self.service.generate_temp_filename("x.pdf") for _ in range(100)}
+        assert len(names) == 100  # collision-resistant
+
+    def test_is_valid_file_path_rejects_sibling_prefix(self):
+        # A sibling dir sharing a name prefix must not be treated as inside files_dir.
+        sibling = self.temp_dir + "_evil"
+        os.makedirs(sibling, exist_ok=True)
+        try:
+            evil = os.path.join(sibling, "x.pdf")
+            with open(evil, "w") as f:
+                f.write("x")
+            assert self.service._is_valid_file_path(evil) is False
+        finally:
+            shutil.rmtree(sibling)
+
+    def test_cleanup_stale_files(self):
+        import time
+        old = self._make_file("old.pdf")
+        fresh = self._make_file("fresh.pdf")
+        # Backdate the "old" file well beyond the threshold.
+        os.utime(old, (time.time() - 10000, time.time() - 10000))
+        removed = self.service.cleanup_stale_files(max_age_seconds=3600)
+        assert removed == 1
+        assert not os.path.exists(old)
+        assert os.path.exists(fresh)
 
     def test_is_valid_job_id(self):
         assert self.service._is_valid_job_id("job-123") is True
@@ -861,6 +919,35 @@ class TestTelegramPrinterBot:
         mock_message.document = None
         mock_message.photo = None
         assert self.bot._extract_file_info(mock_message) is None
+
+    def test_extract_file_info_handles_missing_size(self):
+        # Telegram may omit file_size; it must not become None (would crash validation).
+        mock_message = Mock()
+        mock_message.document.file_id = "doc"
+        mock_message.document.file_size = None
+        mock_message.document.file_name = "t.pdf"
+        mock_message.photo = None
+        info = self.bot._extract_file_info(mock_message)
+        assert info.file_size == 0
+
+    @pytest.mark.asyncio
+    async def test_range_input_invalid_keeps_awaiting_state(self):
+        mock_update = AsyncMock()
+        mock_update.message.text = "garbage"
+        mock_update.message.from_user.id = 1
+        mock_update.message.from_user.username = "u"
+        mock_update.callback_query = None
+        context = Mock()
+        context.bot = AsyncMock()
+        context.user_data = {
+            "awaiting_range": {"scope": SCOPE_JOB, "key": "tok", "chat_id": 9, "message_id": 8},
+            "jobs": {"tok": {"file_path": "/x.pdf", "page_count": 5,
+                             "options": PrintOptions(), "printers": []}},
+        }
+        self.mock_service.is_user_authorized.return_value = True
+        await self.bot.text_callback(mock_update, context)
+        # still awaiting so the user's next message is retried as a range
+        assert "awaiting_range" in context.user_data
 
 
 class TestSetupLogging:
