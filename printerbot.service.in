@@ -1,0 +1,23 @@
+[Unit]
+Description=Telegram printer bot
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=20
+@USERLINE@
+WorkingDirectory=@WORKDIR@
+ExecStart=@PYTHON@ -m printerbot
+
+# Hardening (kept modest so LibreOffice/poppler keep working).
+# Provide a private /tmp and /var/tmp.
+PrivateTmp=true
+# Mount /usr, /boot and /etc read-only for the process.
+ProtectSystem=full
+# Disallow gaining new privileges via execve().
+NoNewPrivileges=true
+
+[Install]
+WantedBy=@WANTEDBY@

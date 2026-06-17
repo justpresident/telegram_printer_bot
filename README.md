@@ -77,9 +77,27 @@ collaborator behind an interface so it can be swapped or tested in isolation:
 Put your bot token in `./token` and the shared password in `./auth_password`, then run from the
 project directory:
 ```
-python3 -m printerbot
+python3 -m printerbot      # or: make run
 ```
-A `printerbot.service` systemd unit is included for running it as a service.
+
+## Installing as a service
+The included `Makefile` renders `printerbot.service.in` for *this* checkout — its directory, your
+user, and the active `python3` — so nothing is hardcoded. Run it from the directory you want the
+bot to live in:
+
+```
+make install          # per-user service (systemctl --user), runs as you, no root
+```
+
+This installs the unit to `~/.config/systemd/user/`, starts it, and enables lingering so it keeps
+running after you log out. Follow logs with `journalctl --user -u printerbot.service -f`, and
+remove it with `make uninstall`.
+
+Prefer a system-wide service (starts at boot independent of any login)?
+```
+make install-system   # installs to /etc/systemd/system with User=<you> (uses sudo)
+```
+`make print-unit` shows the rendered unit without installing anything; `make help` lists all targets.
 
 # Running the tests
 ```
