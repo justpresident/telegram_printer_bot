@@ -18,7 +18,8 @@ from telegram.ext import filters
 from .domain import FileType, FileInfo, PrintResult, JobPhase
 from .service import PrinterBotService
 from .ui import (
-    build_options_keyboard, apply_option_action, fenced_block,
+    build_options_keyboard, build_submenu_keyboard,
+    apply_option_action, apply_field_choice, fenced_block,
     BOT_COMMANDS, SCOPE_JOB, SCOPE_SETTINGS,
 )
 
@@ -380,69 +381,86 @@ class TelegramPrinterBot:
             await self._edit_panel(query, "❌ Invalid button data")
             return
 
-        if scope == SCOPE_JOB:
-            await self._handle_job_button(query, context, verb, key, user_id)
-        else:
-            await self._handle_settings_button(query, context, verb, key, user_id)
+        await self._handle_panel_button(query, context, verb, scope, key, user_id)
 
     async def _handle_cancel_button(self, query, job_id: str):
         success, message = await self._offload(self.service.cancel_job, job_id)
         emoji = "🚫" if success else "❌"
         await self._edit_panel(query, f"{emoji} {message}")
 
-    async def _handle_job_button(self, query, context, verb, token, user_id):
-        registry = self._job_registry(context)
-        entry = registry.get(token)
-        if not entry:
-            await self._edit_panel(query, "⌛ This file is no longer available. Please re-send it.")
-            return
+    async def _handle_panel_button(self, query, context, verb, scope, key, user_id):
+        """Single router for the per-job ('j') and settings ('s') option panels:
+        sub-menu open/back/set, the copies & dry-run controls, range entry, and
+        the job-only Print/Delete and settings-only Done actions."""
+        # Resolve where the current options live and how to persist a change.
+        entry = settings = None
+        if scope == SCOPE_JOB:
+            entry = self._job_registry(context).get(key)
+            if not entry:
+                await self._edit_panel(query, "⌛ This file is no longer available. Please re-send it.")
+                return
+            options = entry["options"]
+            printer_names = entry.get("printers") or []
+        else:
+            settings = self.service.get_user_settings(user_id)
+            options = settings.default_options
+            printer_names = await self._printer_names()
 
-        if verb == "delete":
-            success, message = self.service.delete_file(entry["file_path"])
-            registry.pop(token, None)
-            await self._edit_panel(query, f"{'🗑️' if success else '❌'} {message}")
-            return
+        def persist(new_options):
+            if entry is not None:
+                entry["options"] = new_options
+            else:
+                self.service.update_user_settings(user_id, replace(settings, default_options=new_options))
 
-        if verb == "print":
-            result = await self._offload(self.service.print_file, entry["file_path"], entry["options"])
-            registry.pop(token, None)
+        # Terminal actions.
+        if scope == SCOPE_JOB and verb == "print":
+            result = await self._offload(self.service.print_file, entry["file_path"], options)
+            self._job_registry(context).pop(key, None)
             if not result.success:
                 await self._edit_panel(query, f"❌ {result.message}")
-                return
-            await self._start_live_status(query, context, result, entry["page_count"])
+            else:
+                await self._start_live_status(query, context, result, entry["page_count"])
             return
-
-        if verb == "range":
-            await self._prompt_for_range(query, context, SCOPE_JOB, token)
+        if scope == SCOPE_JOB and verb == "delete":
+            success, message = await self._offload(self.service.delete_file, entry["file_path"])
+            self._job_registry(context).pop(key, None)
+            await self._edit_panel(query, f"{'🗑️' if success else '❌'} {message}")
             return
-
-        # An option mutation: update the registry entry and re-render.
-        entry["options"] = apply_option_action(entry["options"], verb, entry.get("printers"))
-        await self._rerender_keyboard(query, entry["options"], SCOPE_JOB, token, entry.get("printers"))
-
-    async def _handle_settings_button(self, query, context, verb, key, user_id):
-        settings = self.service.get_user_settings(user_id)
-        options = settings.default_options
-        printer_names = await self._printer_names()
-
-        if verb == "done":
+        if scope == SCOPE_SETTINGS and verb == "done":
             await self._edit_panel(query, "✅ Settings saved. They'll apply to every new file.")
             return
 
         if verb == "range":
-            await self._prompt_for_range(query, context, SCOPE_SETTINGS, key)
+            await self._prompt_for_range(query, context, scope, key)
             return
 
-        new_options = apply_option_action(options, verb, printer_names)
-        self.service.update_user_settings(user_id, replace(settings, default_options=new_options))
-        await self._rerender_keyboard(query, new_options, SCOPE_SETTINGS, key, printer_names)
+        # Sub-menu navigation.
+        if verb.startswith("open:"):
+            field = verb.split(":", 1)[1]
+            await self._render_panel(query, build_submenu_keyboard(field, options, scope, key, printer_names))
+            return
+        if verb == "back":
+            await self._render_panel(query, build_options_keyboard(options, scope, key, printer_names))
+            return
+        if verb.startswith("set:"):
+            parts = verb.split(":", 2)  # set:<field>:<index>
+            if len(parts) != 3 or not parts[2].lstrip("-").isdigit():
+                return
+            new_options = apply_field_choice(options, parts[1], int(parts[2]), printer_names)
+            persist(new_options)
+            await self._render_panel(query, build_options_keyboard(new_options, scope, key, printer_names))
+            return
 
-    async def _rerender_keyboard(self, query, options, scope, key, printer_names):
-        keyboard = build_options_keyboard(options, scope, key, printer_names)
+        # Simple controls (copies stepper, dry-run toggle).
+        new_options = apply_option_action(options, verb)
+        persist(new_options)
+        await self._render_panel(query, build_options_keyboard(new_options, scope, key, printer_names))
+
+    async def _render_panel(self, query, keyboard):
         try:
             await query.edit_message_reply_markup(reply_markup=keyboard)
         except Exception as e:
-            self.logger.error(f"Error re-rendering keyboard: {e}")
+            self.logger.error(f"Error rendering panel: {e}")
 
     # -- page-range typed input ---------------------------------------------
 

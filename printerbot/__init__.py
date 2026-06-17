@@ -23,7 +23,8 @@ from .adapters import (
 )
 from .service import PrinterBotService
 from .ui import (
-    fenced_block, apply_option_action, build_options_keyboard,
+    fenced_block, apply_option_action, apply_field_choice, field_choices,
+    build_options_keyboard, build_submenu_keyboard,
     BOT_COMMANDS, SCOPE_JOB, SCOPE_SETTINGS,
 )
 from .bot import TelegramPrinterBot
@@ -42,7 +43,8 @@ __all__ = [
     "InMemoryAuthManager", "FileAuthManager", "PersistentAuthManager",
     "StoreBackedUserSettings",
     "PrinterBotService",
-    "fenced_block", "apply_option_action", "build_options_keyboard",
+    "fenced_block", "apply_option_action", "apply_field_choice", "field_choices",
+    "build_options_keyboard", "build_submenu_keyboard",
     "BOT_COMMANDS", "SCOPE_JOB", "SCOPE_SETTINGS",
     "TelegramPrinterBot",
     "setup_logging", "main",

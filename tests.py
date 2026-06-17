@@ -17,7 +17,9 @@ from printerbot import (
     InMemoryStateStore, JsonFileStore,
     PersistentAuthManager, StoreBackedUserSettings,
     # UI pure functions
-    apply_option_action, build_options_keyboard, fenced_block, SCOPE_JOB, SCOPE_SETTINGS,
+    apply_option_action, apply_field_choice, field_choices,
+    build_options_keyboard, build_submenu_keyboard, fenced_block,
+    SCOPE_JOB, SCOPE_SETTINGS,
 )
 
 
@@ -278,32 +280,6 @@ class TestApplyOptionAction:
         assert apply_option_action(PrintOptions(copies=1), "copies_inc").copies == 2
         assert apply_option_action(PrintOptions(copies=99), "copies_inc").copies == 99
 
-    def test_duplex_cycles(self):
-        o = apply_option_action(PrintOptions(), "duplex")
-        assert o.duplex == Duplex.TWO_SIDED_LONG
-        o = apply_option_action(o, "duplex")
-        assert o.duplex == Duplex.TWO_SIDED_SHORT
-        o = apply_option_action(o, "duplex")
-        assert o.duplex == Duplex.ONE_SIDED
-
-    def test_color_toggles(self):
-        o = apply_option_action(PrintOptions(), "color")
-        assert o.color == ColorMode.GRAYSCALE
-        assert apply_option_action(o, "color").color == ColorMode.COLOR
-
-    def test_paper_and_nup_cycle(self):
-        assert apply_option_action(PrintOptions(), "paper").paper_size == PaperSize.LETTER
-        assert apply_option_action(PrintOptions(), "nup").number_up == 2
-
-    def test_printer_cycles_through_list(self):
-        names = ["A", "B", "C"]
-        o = apply_option_action(PrintOptions(printer=None), "printer", names)
-        assert o.printer == "B"  # current resolves to A, next is B
-        assert apply_option_action(PrintOptions(printer="C"), "printer", names).printer == "A"
-
-    def test_printer_noop_without_printers(self):
-        assert apply_option_action(PrintOptions(), "printer", []).printer is None
-
     def test_dryrun_toggles(self):
         on = apply_option_action(PrintOptions(), "dryrun")
         assert on.dry_run is True
@@ -312,6 +288,71 @@ class TestApplyOptionAction:
     def test_unknown_verb_is_noop(self):
         o = PrintOptions(copies=2)
         assert apply_option_action(o, "whatever") == o
+
+
+class TestFieldChoices:
+    def test_duplex_choices_mark_current(self):
+        choices = field_choices("duplex", PrintOptions(duplex=Duplex.TWO_SIDED_LONG))
+        selected = [label for label, sel in choices if sel]
+        assert len(choices) == 3
+        assert len(selected) == 1 and "long edge" in selected[0]
+
+    def test_color_choices(self):
+        choices = field_choices("color", PrintOptions(color=ColorMode.GRAYSCALE))
+        assert [sel for _, sel in choices] == [False, True]
+
+    def test_printer_choices_include_system_default(self):
+        # default selected when printer is None
+        choices = field_choices("printer", PrintOptions(printer=None), ["A", "B"])
+        assert choices[0] == ("System default", True)
+        assert choices[1] == ("A", False)
+        # a chosen printer marks itself and unmarks default
+        choices = field_choices("printer", PrintOptions(printer="B"), ["A", "B"])
+        assert choices[0] == ("System default", False)
+        assert ("B", True) in choices
+
+    def test_apply_field_choice_sets_value(self):
+        assert apply_field_choice(PrintOptions(), "duplex", 1).duplex == Duplex.TWO_SIDED_LONG
+        assert apply_field_choice(PrintOptions(), "color", 1).color == ColorMode.GRAYSCALE
+        assert apply_field_choice(PrintOptions(), "paper", 1).paper_size == PaperSize.LETTER
+        assert apply_field_choice(PrintOptions(), "nup", 1).number_up == 2
+
+    def test_apply_printer_choice_roundtrips_default(self):
+        names = ["A", "B"]
+        chosen = apply_field_choice(PrintOptions(), "printer", 2, names)
+        assert chosen.printer == "B"
+        # index 0 returns to System default (the bug being fixed)
+        back = apply_field_choice(chosen, "printer", 0, names)
+        assert back.printer is None
+
+    def test_apply_field_choice_out_of_range_is_noop(self):
+        o = PrintOptions(number_up=2)
+        assert apply_field_choice(o, "nup", 99) == o
+        assert apply_field_choice(o, "printer", 5, ["A"]) == o
+
+
+class TestBuildSubmenuKeyboard:
+    def _callbacks(self, markup):
+        return [btn.callback_data for row in markup.inline_keyboard for btn in row]
+
+    def test_submenu_lists_choices_and_back(self):
+        markup = build_submenu_keyboard("paper", PrintOptions(), SCOPE_JOB, "tok", [])
+        cbs = self._callbacks(markup)
+        # one set:<field>:<idx> per paper option, plus a back button
+        assert "set:paper:0 j:tok" in cbs
+        assert "set:paper:1 j:tok" in cbs
+        assert "back j:tok" in cbs
+
+    def test_submenu_marks_selected(self):
+        markup = build_submenu_keyboard("color", PrintOptions(color=ColorMode.GRAYSCALE), SCOPE_SETTINGS, "_", [])
+        labels = [b.text for row in markup.inline_keyboard for b in row]
+        selected = [t for t in labels if t.startswith("🔘")]
+        assert len(selected) == 1 and "Grayscale" in selected[0]
+
+    def test_submenu_callbacks_within_limit(self):
+        markup = build_submenu_keyboard("printer", PrintOptions(), SCOPE_JOB, "deadbeef", ["A", "B", "C"])
+        for c in self._callbacks(markup):
+            assert len(c.encode()) <= 64
 
 
 class TestBuildOptionsKeyboard:
@@ -349,7 +390,12 @@ class TestBuildOptionsKeyboard:
         one = build_options_keyboard(PrintOptions(), SCOPE_JOB, "t", ["A"])
         many = build_options_keyboard(PrintOptions(), SCOPE_JOB, "t", ["A", "B"])
         assert not any("printer" in c for c in self._callbacks(one))
-        assert any(c == "printer j:t" for c in self._callbacks(many))
+        assert any(c == "open:printer j:t" for c in self._callbacks(many))
+
+    def test_selectors_open_submenus(self):
+        cbs = self._callbacks(build_options_keyboard(PrintOptions(), SCOPE_JOB, "t", []))
+        for field in ("duplex", "color", "paper", "nup"):
+            assert f"open:{field} j:t" in cbs
 
     def test_callback_data_within_telegram_limit(self):
         markup = build_options_keyboard(PrintOptions(), SCOPE_JOB, "deadbeef", ["A", "B"])
@@ -838,6 +884,29 @@ class TestTelegramPrinterBot:
         await self.bot.button(mock_update, context)
 
         assert context.user_data["jobs"]["tok"]["options"].copies == 2
+        query.edit_message_reply_markup.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_button_submenu_set_updates_option(self):
+        # open:duplex then set:duplex:1 should set duplex on the job and re-render.
+        query = AsyncMock()
+        query.data = "set:duplex:1 j:tok"
+        query.from_user.id = 1
+        query.from_user.username = "u"
+        query.message.photo = None
+        mock_update = Mock()
+        mock_update.message = None
+        mock_update.callback_query = query
+        context = Mock()
+        context.user_data = {"jobs": {"tok": {
+            "file_path": "/x.pdf", "page_count": 1,
+            "options": PrintOptions(), "printers": [],
+        }}}
+        self.mock_service.is_user_authorized.return_value = True
+
+        await self.bot.button(mock_update, context)
+
+        assert context.user_data["jobs"]["tok"]["options"].duplex == Duplex.TWO_SIDED_LONG
         query.edit_message_reply_markup.assert_awaited()
 
     @pytest.mark.asyncio

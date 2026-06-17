@@ -22,7 +22,10 @@ After printing, the message keeps you posted on the job's progress and offers a 
 The full command list is also registered with Telegram, so it shows up in the `/` autocomplete menu.
 
 ## Print options
-Both the per-file panel and `/settings` expose the same controls (translated to CUPS `lp` options):
+Both the per-file panel and `/settings` expose the same controls (translated to CUPS `lp` options).
+Copies use a `➖ / ➕` stepper; the rest are **tap-to-expand selectors** (marked `▾`) — tapping one
+shows all of its choices (current marked `🔘`), and tapping a choice selects it and returns to the
+panel:
 
  * **Copies** — `➖ / ➕` stepper
  * **Sides** — single-sided / double-sided (long or short edge)
@@ -30,7 +33,7 @@ Both the per-file panel and `/settings` expose the same controls (translated to 
  * **Paper size** — A4 / Letter / Legal / A3
  * **Pages per sheet** — 1 / 2 / 4 / 6 (N-up)
  * **Page range** — type e.g. `2-5` or `1,3,5`, or `all`
- * **Printer** — when more than one CUPS printer is available, pick the target
+ * **Printer** — when more than one CUPS printer is available, pick the target (or "System default")
 
 Per-file choices start from your saved `/settings` defaults and can be tweaked just for that file.
 
