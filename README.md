@@ -1,4 +1,8 @@
 # Telegram printer bot
+
+![CI](https://github.com/justpresident/telegram_printer_bot/actions/workflows/ci.yml/badge.svg)
+![Coverage](./.github/badges/coverage.svg)
+
 This is a simple bot that allows you to print on your home printer from anywhere from any device that has a telegram client.
 It also exposes some basic printer diagnostics and print job management.
 In order to print something, just upload a file without any commands. A lot of formats are supported.
