@@ -73,11 +73,15 @@ class TestSystemPrinter:
         assert jobs.error is None
         assert runner.calls[0] == ["lpstat", "-W", "not-completed"]
 
-    def test_get_completed_jobs_truncates_to_ten(self):
+    def test_get_completed_jobs_returns_newest_ten(self):
         lines = "\n".join(f"job-{i}" for i in range(20))
         runner = FakeCommandRunner(default=CommandResult(0, lines, ""))
         jobs = SystemPrinter(runner=runner).get_completed_jobs()
-        assert jobs.jobs.count("\n") == 9  # 10 lines
+        result_lines = jobs.jobs.splitlines()
+        assert len(result_lines) == 10
+        # lpstat lists oldest-first, so the newest 10 are job-10..job-19
+        assert result_lines[0] == "job-10"
+        assert result_lines[-1] == "job-19"
         assert runner.calls[0] == ["lpstat", "-W", "completed"]
 
     def test_cancel_job_success(self):

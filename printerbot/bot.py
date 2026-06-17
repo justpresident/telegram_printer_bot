@@ -528,8 +528,13 @@ class TelegramPrinterBot:
             )
         )
 
+    # consecutive UNKNOWN polls (before the job is ever seen active) after which
+    # we assume a fast job already printed and was purged, and finalize.
+    UNKNOWN_GRACE_POLLS = 3
+
     async def _poll_job_status(self, context, chat_id, message_id, job_id, page_count, is_photo):
         seen_active = False
+        unknown_polls = 0
         cancel_kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🚫 Cancel", callback_data=f"cancel {job_id}")]]
         )
@@ -543,14 +548,24 @@ class TelegramPrinterBot:
                                            f"✅ Printed {page_count} page(s) — job {job_id}")
                     return
                 if state.phase in (JobPhase.PROCESSING, JobPhase.PENDING):
+                    unknown_polls = 0
                     if not seen_active:
                         seen_active = True
                         await self._edit_by_id(context, chat_id, message_id, is_photo,
                                                f"🖨️ Printing… job {job_id}", cancel_kb)
-                elif state.phase == JobPhase.UNKNOWN and seen_active:
-                    await self._edit_by_id(context, chat_id, message_id, is_photo,
-                                           f"✅ Finished — job {job_id}")
-                    return
+                else:  # UNKNOWN — no longer in any CUPS queue
+                    if seen_active:
+                        await self._edit_by_id(context, chat_id, message_id, is_photo,
+                                               f"✅ Finished — job {job_id}")
+                        return
+                    # Never seen active: a very fast job may have printed and been
+                    # purged before our first poll. Finalize after a short grace
+                    # rather than leaving the user staring at "queued…".
+                    unknown_polls += 1
+                    if unknown_polls >= self.UNKNOWN_GRACE_POLLS:
+                        await self._edit_by_id(context, chat_id, message_id, is_photo,
+                                               f"✅ Finished — job {job_id}")
+                        return
         except Exception as e:
             self.logger.error(f"Error polling job status: {e}")
 

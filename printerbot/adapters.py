@@ -43,7 +43,8 @@ class SystemPrinter(PrinterInterface):
         result = self.runner.run(["lpstat", "-W", "completed"])
         if not result.ok:
             return JobStatus(jobs="", error=result.stderr.strip() or "lpstat failed")
-        lines = result.stdout.strip().splitlines()[:10]
+        # lpstat lists completed jobs oldest-first; the last 10 are the newest.
+        lines = result.stdout.strip().splitlines()[-10:]
         return JobStatus(jobs="\n".join(lines))
 
     def cancel_job(self, job_id: str) -> bool:

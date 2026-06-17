@@ -13,3 +13,4 @@ state.json.tmp
 .coverage
 coverage.xml
 htmlcov
+state.json.lock
